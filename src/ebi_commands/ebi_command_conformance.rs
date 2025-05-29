@@ -17,6 +17,7 @@ use crate::{
         earth_movers_stochastic_conformance::EarthMoversStochasticConformance,
         entropic_relevance::EntropicRelvance,
         jensen_shannon_stochastic_conformance::JensenShannonStochasticConformance,
+        stochastic_markovian_abstraction::StochasticMarkovianAbstraction,
         unit_earth_movers_stochastic_conformance::UnitEarthMoversStochasticConformance,
     },
 };
@@ -32,6 +33,7 @@ pub const EBI_CONFORMANCE: EbiCommand = EbiCommand::Group {
         &CONFORMANCE_ER,
         &CONFORMANCE_JSSC,
         &CONFORMANCE_JSSC_SAMPLE,
+        &CONFORMANCE_STOCHASTIC_MARKOVIAN,
         &CONFORMANCE_UEMSC,
     ],
 };
@@ -273,6 +275,48 @@ pub const CONFORMANCE_EMSC_SAMPLE: EbiCommand = EbiCommand::Command {
                 .earth_movers_stochastic_conformance(lang_b.as_mut())
                 .context("Compute EMSC.")?,
         ))
+    },
+    output_type: &EbiOutputType::Fraction,
+};
+
+pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
+    name_short: "sma",
+    name_long: Some("stochastic-markovian-abstraction"),
+    explanation_short: "Compare languages using Stochastic Markovian Abstraction.",
+    explanation_long: Some("Compare stochastic languages using the Stochastic Markovian Abstraction, which represents languages based on the expected frequency of subtraces to better handle partially matching traces."),
+    // TODO: add latex link
+    latex_link: None,
+    cli_command: None,
+    exact_arithmetic: true,
+    input_types: &[
+        &[&EbiInputType::Trait(EbiTrait::FiniteStochasticLanguage)],
+        &[&EbiInputType::Trait(EbiTrait::QueriableStochasticLanguage)],
+        &[&EbiInputType::Usize],
+    ],
+    input_names: &["FILE_1", "FILE_2", "K_ORDER"],
+    input_helps: &[
+        "A finite stochastic language (log) to compare.",
+        "A queriable stochastic language (model) to compare.",
+        "The order k of the Markovian abstraction (should be at least 2).",
+    ],
+    execute: |mut inputs, _| {
+        let log = inputs
+            .remove(0)
+            .to_type::<dyn EbiTraitFiniteStochasticLanguage>()?;
+        
+        let model = inputs
+            .remove(0)
+            .to_type::<dyn EbiTraitQueriableStochasticLanguage>()?;
+        
+        let k = inputs
+            .remove(0)
+            .to_type::<usize>()?;
+        
+        
+        let result = log.markovian_uemsc(model, *k)
+            .context("Compute SMA.")?;
+        
+        Ok(EbiOutput::Fraction(result))
     },
     output_type: &EbiOutputType::Fraction,
 };
