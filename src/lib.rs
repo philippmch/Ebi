@@ -65,6 +65,7 @@ pub mod ebi_objects {
     pub mod stochastic_process_tree_semantics;
     pub mod stochastic_deterministic_finite_automaton;
     pub mod stochastic_deterministic_finite_automaton_semantics;
+    pub mod stochastic_nondeterministic_finite_automaton;
     pub mod stochastic_labelled_petri_net;
     pub mod stochastic_labelled_petri_net_semantics;
     pub mod stochastic_language_of_alignments;
