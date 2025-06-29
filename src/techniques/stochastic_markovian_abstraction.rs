@@ -1,10 +1,18 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
 use crate::{
+    ebi_framework::activity_key::TranslateActivityKey,
+    ebi_objects::finite_stochastic_language::FiniteStochasticLanguage,
     ebi_objects::stochastic_labelled_petri_net::StochasticLabelledPetriNet,
+    ebi_objects::stochastic_nondeterministic_finite_automaton::{
+        StochasticNondeterministicFiniteAutomaton as Snfa,
+        State as SnfaState,
+        Transition as SnfaTransition,
+    },
     ebi_traits::{
         ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage,
         ebi_trait_queriable_stochastic_language::EbiTraitQueriableStochasticLanguage,
@@ -46,24 +54,34 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
             return Err(anyhow::anyhow!("k must be at least 2"));
         }
 
-        // Discard the language2 parameter for now
-        let _ = &language2;
-
-        // Step 1: Compute abstraction for the log (self)
+        // Step 1: Compute abstraction for the first language (self = finite log)
         let abstraction1 = compute_abstraction_for_log(self, k)
-            .context("Computing abstraction for first language")?;
+            .context("Computing abstraction for first language (finite log)")?;
 
-        // Step 2: Compute abstraction for language2
-        // Might need to cast to known types like StochasticLabelledPetriNet
-        // TODO: Implement this ; currently just returns a dummy abstraction
-        let abstraction2 = {
-            let mut abstraction = HashMap::new();
-            let example_subtrace = vec!["b".to_string(), "c".to_string()];
-            // Convert to Arc<[String]> to match the expected type
-            let arc_subtrace = Arc::<[String]>::from(example_subtrace);
-            abstraction.insert(arc_subtrace, Fraction::from((1, 1)));
+        // Step 2: Before computing the abstraction for the second language we must
+        // make sure it uses the same activity labels for the same activities
 
-            MarkovianAbstraction { k, abstraction }
+        let mut shared_key = self.get_activity_key().clone();
+
+        let mut language2 = language2;
+
+        // Down-cast the boxed trait object
+        let abstraction2 = if let Some(petri_net) = (&mut *language2 as &mut dyn Any)
+            .downcast_mut::<StochasticLabelledPetriNet>()
+        {
+            petri_net.translate_using_activity_key(&mut shared_key);
+            compute_abstraction_for_petri_net(petri_net, k)
+                .context("Computing abstraction for second language (Petri net)")?
+        } else if let Some(finite_lang) = (&mut *language2 as &mut dyn Any)
+            .downcast_mut::<FiniteStochasticLanguage>()
+        {
+            finite_lang.translate_using_activity_key(&mut shared_key);
+            compute_abstraction_for_log(finite_lang, k)
+                .context("Computing abstraction for second language (finite log)")?
+        } else {
+            return Err(anyhow::anyhow!(
+                "markovian_uemsc: unsupported type for second language; expected StochasticLabelledPetriNet or FiniteStochasticLanguage"
+            ));
         };
 
         // Step 3: Compute the distance between the abstractions
@@ -169,12 +187,6 @@ fn compute_multiset_k_trimmed_subtraces_iterative(trace: &[String], k: usize) ->
 
     result
 }
-
-use crate::ebi_objects::stochastic_nondeterministic_finite_automaton::{
-    StochasticNondeterministicFiniteAutomaton as Snfa,
-    State as SnfaState,
-    Transition as SnfaTransition,
-};
 
 // Embedded-SNFA construction
 fn build_embedded_snfa(net: &StochasticLabelledPetriNet) -> Result<Snfa> {
@@ -504,72 +516,91 @@ pub fn compute_abstraction_for_petri_net(
     Ok(MarkovianAbstraction { k, abstraction })
 }
 
-/// Compute a distance measure between two Markovian abstractions
+/// Compute the m^k-uEMSC distance between two Markovian abstractions
 pub fn compute_uemsc_distance(
-    _abstraction1: &MarkovianAbstraction,
-    _abstraction2: &MarkovianAbstraction
+    abstraction1: &MarkovianAbstraction,
+    abstraction2: &MarkovianAbstraction,
 ) -> Result<Fraction> {
-    // TODO: Implement the m^k-uEMSC distance calculation
-    
-    Ok(Fraction::from((1, 2))) // 0.5 as a fraction
+    // Sanity-check: abstractions must be of the same order k
+    if abstraction1.k != abstraction2.k {
+        return Err(anyhow::anyhow!(
+            "Cannot compare abstractions of different order: k1={}, k2={}",
+            abstraction1.k, abstraction2.k
+        ));
+    }
+
+    // Sum for Σ_γ max(m1(γ) − m2(γ), 0)
+    let mut positive_diff = Fraction::from((0, 1));
+    let zero = Fraction::from((0, 1));
+
+    for (gamma, p1) in &abstraction1.abstraction {
+        let p2 = abstraction2
+            .abstraction
+            .get(gamma)
+            .unwrap_or(&zero);
+
+        if p1 > p2 {
+            let diff = &*p1 - &*p2;
+            positive_diff += diff;
+        }
+    }
+
+    // Distance = 1 - positive_diff
+    let one = Fraction::from((1, 1));
+    let distance = &one - &positive_diff;
+
+    Ok(distance)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use crate::ebi_objects::finite_stochastic_language::FiniteStochasticLanguage;
-    use crate::ebi_framework::activity_key::ActivityKey;
+    use crate::ebi_objects::event_log::EventLog;
     use crate::ebi_objects::stochastic_labelled_petri_net::StochasticLabelledPetriNet;
+    use crate::ebi_traits::ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage;
+    use crate::ebi_framework::activity_key::{HasActivityKey, TranslateActivityKey};
     use super::*;
 
     #[test]
     fn test_compute_abstraction_for_example_log() {
-        // Example log L_1 = [⟨a,b⟩^{50}, ⟨a,a,b,c⟩^{20}, ⟨a,a,c,b⟩^{10}]
-        let mut activity_key = ActivityKey::new();
-        let mut traces = HashMap::new();
+        let file_content = fs::read_to_string("testfiles/simple_log_markovian_abstraction.xes").unwrap();
+        let event_log = file_content.parse::<EventLog>().unwrap();
+        let finite_lang: FiniteStochasticLanguage = Into::into(event_log);
         
-        // Create traces with probabilities 5/8, 1/4, 1/8
-        traces.insert(
-            activity_key.process_trace(&vec!["a".to_string(), "b".to_string()]),
-            Fraction::from((50, 80)) // 5/8
-        );
-        traces.insert(
-            activity_key.process_trace(&vec!["a".to_string(), "a".to_string(), "b".to_string(), "c".to_string()]),
-            Fraction::from((20, 80)) // 1/4
-        );
-        traces.insert(
-            activity_key.process_trace(&vec!["a".to_string(), "a".to_string(), "c".to_string(), "b".to_string()]),
-            Fraction::from((10, 80)) // 1/8
-        );
-        
-        // Compute k=2 abstraction
-        let abstraction = compute_abstraction_for_log(
-            &FiniteStochasticLanguage::new_raw(traces, activity_key), 2
-        ).unwrap();
+        // Compute abstraction with k=2 for example log [⟨a,b⟩^{5}, ⟨a,a,b,c⟩^{2}, ⟨a,a,c,b⟩^{1}]
+        let abstraction = compute_abstraction_for_log(&finite_lang, 2).unwrap();
         
         println!("\nComputed abstraction for example log with k=2:");
 
-        // Expected values for k=2 with activity mapping: ac0=a, ac1=b, ac2=c
         assert_eq!(abstraction.abstraction.len(), 8, "Should be exactly 8 entries");
         
-        // For each entry in the abstraction, print it and check its value
-        for (subtrace, probability) in abstraction.abstraction.iter() {
-            let subtrace_str = subtrace.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
-            println!("{:<12} : {}", subtrace_str, probability);
-            
-            // Verify the value is correct
-            match subtrace_str.as_str() {
-                "+,ac0"    => assert_eq!(*probability, Fraction::from((4, 15))),
-                "ac0,ac0"  => assert_eq!(*probability, Fraction::from((1, 10))),
-                "ac0,ac1"  => assert_eq!(*probability, Fraction::from((7, 30))),
-                "ac0,ac2"  => assert_eq!(*probability, Fraction::from((1, 30))),
-                "ac1,-"    => assert_eq!(*probability, Fraction::from((1, 5))),
-                "ac1,ac2"  => assert_eq!(*probability, Fraction::from((1, 15))),
-                "ac2,-"    => assert_eq!(*probability, Fraction::from((1, 15))),
-                "ac2,ac1"  => assert_eq!(*probability, Fraction::from((1, 30))),
-                _ => panic!("Unexpected subtrace found: {}", subtrace_str)
-            }
+        // map for checking
+        let mut check: std::collections::HashMap<String, Fraction> = std::collections::HashMap::new();
+        for (subtrace, prob) in abstraction.abstraction.iter() {
+            let key = subtrace.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
+            println!("{:<12} : {}", key, prob);
+            check.insert(key, prob.clone());
         }
+
+        assert_eq!(check["+,ac0"], Fraction::from((4, 15)));
+        assert_eq!(check["ac0,ac0"], Fraction::from((1, 10)));
+
+        let pair1 = [Fraction::from((7, 30)), Fraction::from((1, 30))];
+        let pair2 = [Fraction::from((1, 5)), Fraction::from((1, 15))];
+        let pair3 = [Fraction::from((1, 15)), Fraction::from((1, 30))];
+
+        // Helper to check that a key has one of two expected values and that the other value is on the other key
+        fn assert_pair(check: &std::collections::HashMap<String, Fraction>, k1: &str, k2: &str, exp: [Fraction; 2]) {
+            let v1 = check.get(k1).expect("missing key");
+            let v2 = check.get(k2).expect("missing key");
+            assert!( (v1 == &exp[0] && v2 == &exp[1]) || (v1 == &exp[1] && v2 == &exp[0]),
+                "Pair {{ {}, {} }} has unexpected values {{ {}, {} }}", k1, k2, v1, v2);
+        }
+
+        assert_pair(&check, "ac0,ac1", "ac0,ac2", pair1);
+        assert_pair(&check, "ac1,-",   "ac2,-",   pair2);
+        assert_pair(&check, "ac1,ac2", "ac2,ac1", pair3);
     }
     
     #[test]
@@ -621,5 +652,28 @@ mod tests {
         }
 
         println!("Test passed: Abstraction matches expected internal trace probabilities!");
+    }
+
+    #[test]
+    fn test_markovian_uemsc_log_vs_petri_net() {
+        // Load the example log and convert to finite stochastic language
+        let file_content = fs::read_to_string("testfiles/simple_log_markovian_abstraction.xes").unwrap();
+        let event_log = file_content.parse::<EventLog>().unwrap();
+        let mut finite_lang: FiniteStochasticLanguage = Into::into(event_log);
+
+        // Load the Petri net model
+        let file_content = fs::read_to_string("testfiles/simple_markovian_abstraction.slpn").unwrap();
+        let mut petri_net = file_content.parse::<StochasticLabelledPetriNet>().unwrap();
+
+        // Ensure both share a common ActivityKey to avoid nondeterministic mappings
+        petri_net.translate_using_activity_key(finite_lang.get_activity_key_mut());
+
+        // Compute the m^2-uEMSC distance (k = 2)
+        let distance = (&finite_lang as &dyn EbiTraitFiniteStochasticLanguage)
+            .markovian_uemsc(Box::new(petri_net), 2)
+            .unwrap();
+
+        println!("Computed m^2-uEMSC distance: {}", distance);
+        assert_eq!(distance, Fraction::from((4, 5))); // Expect 4/5
     }
 }
