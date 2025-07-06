@@ -465,8 +465,11 @@ pub fn compute_abstraction_for_petri_net(
         return Err(anyhow::anyhow!("k must be at least 2 for Markovian abstraction"));
     }
 
-    // 1 Build embedded SNFA (tau transitions may be present but we assume none for now) TODO: handle tau transitions
-    let snfa_raw = build_embedded_snfa(petri_net)?;
+    // 1 Build embedded SNFA
+    let mut snfa_raw = build_embedded_snfa(petri_net)?;
+
+    // 1.1 Remove tau transitions
+    snfa_raw.remove_tau_transitions();
 
     // 2 Patch it
     let snfa = patch_snfa(&snfa_raw);
