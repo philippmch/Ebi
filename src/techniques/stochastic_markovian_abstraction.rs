@@ -40,13 +40,6 @@ pub enum DistanceMetric {
 }
 
 pub trait StochasticMarkovianAbstraction {
-    /// Compute the uEMSC conformance measure for two stochastic languages
-    fn markovian_uemsc(
-        &self,
-        language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
-        k: usize,
-    ) -> Result<Fraction>;
-
     /// Compare `self` with another stochastic language using the selected
     /// distance metric over their k-th order Markovian abstractions and
     /// return a conformance score in the range [0,1] where 1 means perfect
@@ -81,51 +74,6 @@ pub struct MarkovianAbstraction {
 
 // Implementation for finite stochastic languages (logs)
 impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
-    fn markovian_uemsc(
-        &self,
-        language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
-        k: usize,
-    ) -> Result<Fraction> {
-        // Validate k
-        if k < 2 {
-            return Err(anyhow::anyhow!("k must be at least 2"));
-        }
-
-        // Step 1: Compute abstraction for the first language (self = finite log)
-        let abstraction1 = compute_abstraction_for_log(self, k)
-            .context("Computing abstraction for first language (finite log)")?;
-
-        // Step 2: Before computing the abstraction for the second language we must
-        // make sure it uses the same activity labels for the same activities
-
-        let mut shared_key = self.get_activity_key().clone();
-
-        let mut language2 = language2;
-
-        // Down-cast the boxed trait object
-        let abstraction2 = if let Some(petri_net) = (&mut *language2 as &mut dyn Any)
-            .downcast_mut::<StochasticLabelledPetriNet>()
-        {
-            petri_net.translate_using_activity_key(&mut shared_key);
-            compute_abstraction_for_petri_net(petri_net, k)
-                .context("Computing abstraction for second language (Petri net)")?
-        } else if let Some(finite_lang) = (&mut *language2 as &mut dyn Any)
-            .downcast_mut::<FiniteStochasticLanguage>()
-        {
-            finite_lang.translate_using_activity_key(&mut shared_key);
-            compute_abstraction_for_log(finite_lang, k)
-                .context("Computing abstraction for second language (finite log)")?
-        } else {
-            return Err(anyhow::anyhow!(
-                "markovian_uemsc: unsupported type for second language; expected StochasticLabelledPetriNet or FiniteStochasticLanguage"
-            ));
-        };
-
-        // Step 3: Compute the conformance between the abstractions
-        compute_uemsc_conformance(&abstraction1, &abstraction2)
-            .context("Computing uEMSC conformance between abstractions")
-    }
-
     fn markovian_conformance(
         &self,
         language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
@@ -900,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_markovian_uemsc_log_vs_petri_net() {
+    fn test_markovian_conformance_uemsc_log_vs_petri_net() {
         // Load the example log and convert to finite stochastic language
         let file_content = fs::read_to_string("testfiles/simple_log_markovian_abstraction.xes").unwrap();
         let event_log = file_content.parse::<EventLog>().unwrap();
@@ -915,7 +863,7 @@ mod tests {
 
         // Compute the m^2-uEMSC distance (k = 2)
         let distance = (&finite_lang as &dyn EbiTraitFiniteStochasticLanguage)
-            .markovian_uemsc(Box::new(petri_net), 2)
+            .markovian_conformance(Box::new(petri_net), 2, DistanceMetric::Uemsc)
             .unwrap();
 
         println!("Computed m^2-uEMSC distance: {}", distance);
