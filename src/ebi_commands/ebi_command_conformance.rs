@@ -292,12 +292,14 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
         &[&EbiInputType::Trait(EbiTrait::FiniteStochasticLanguage)],
         &[&EbiInputType::Trait(EbiTrait::QueriableStochasticLanguage)],
         &[&EbiInputType::Usize],
+        &[&EbiInputType::String],
     ],
-    input_names: &["FILE_1", "FILE_2", "K_ORDER"],
+    input_names: &["FILE_1", "FILE_2", "K_ORDER", "METRIC"],
     input_helps: &[
         "A finite stochastic language (log) to compare.",
         "A queriable stochastic language (model) to compare.",
         "The order k of the Markovian abstraction (should be at least 2).",
+        "Distance metric: one of uemsc | tv | js | hellinger.",
     ],
     execute: |mut inputs, _| {
         let log = inputs
@@ -311,11 +313,24 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
         let k = inputs
             .remove(0)
             .to_type::<usize>()?;
-        
-        
-        let result = log.markovian_uemsc(model, *k)
+
+        let metric_str = inputs
+            .remove(0)
+            .to_type::<String>()?;
+
+        use crate::techniques::stochastic_markovian_abstraction::DistanceMetric;
+        let metric = match metric_str.to_ascii_lowercase().as_str() {
+            "uemsc" => DistanceMetric::Uemsc,
+            "tv" | "totalvariation" | "total_variation" => DistanceMetric::TotalVariation,
+            "js" | "jsd" | "jensen" | "jensen-shannon" => DistanceMetric::JensenShannon,
+            "hellinger" | "h" => DistanceMetric::Hellinger,
+            other => return Err(anyhow!(format!("Unknown metric '{}'.", other))),
+        };
+
+        let result = log
+            .markovian_conformance(model, *k, metric)
             .context("Compute SMA.")?;
-        
+
         Ok(EbiOutput::Fraction(result))
     },
     output_type: &EbiOutputType::Fraction,

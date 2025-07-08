@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use num_traits::ToPrimitive;
+
 use crate::{
     ebi_framework::activity_key::TranslateActivityKey,
     ebi_objects::finite_stochastic_language::FiniteStochasticLanguage,
@@ -18,9 +20,24 @@ use crate::{
         ebi_trait_queriable_stochastic_language::EbiTraitQueriableStochasticLanguage,
     },
     marking::Marking,
-    math::fraction::Fraction,
-    math::traits::Zero,
+    math::fraction::{Fraction, MaybeExact},
+    math::traits::{Zero, Signed},
 };
+
+/// Supported distance metrics for Markovian abstraction comparison.
+/// The list can be extended later – variants that are not yet implemented
+/// will return an `anyhow::Error`.
+#[derive(Clone, Copy, Debug)]
+pub enum DistanceMetric {
+    /// Asymmetric m^k-uEMSC distance.
+    Uemsc,
+    /// Symmetric total-variation distance 1/2 Sum|p−m|.
+    TotalVariation,
+    /// Square-root Jensen–Shannon distance.
+    JensenShannon,
+    /// Hellinger distance.
+    Hellinger,
+}
 
 pub trait StochasticMarkovianAbstraction {
     /// Compute the uEMSC conformance measure for two stochastic languages
@@ -28,6 +45,26 @@ pub trait StochasticMarkovianAbstraction {
         &self,
         language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
         k: usize,
+    ) -> Result<Fraction>;
+
+    /// Compare `self` with another stochastic language using the selected
+    /// distance metric over their k-th order Markovian abstractions and
+    /// return a conformance score in the range [0,1] where 1 means perfect
+    /// match.
+    ///
+    /// Implemented metrics:
+    /// * `DistanceMetric::Uemsc` – returns `1 – uEMSC distance`
+    /// * `DistanceMetric::TotalVariation` – returns `1 – TV distance`
+    /// * `DistanceMetric::JensenShannon` – returns `1 – √JSD`
+    /// * `DistanceMetric::Hellinger` – returns `1 – Hellinger`
+    ///
+    /// Any other variant (if added in the future) will yield an error until
+    /// its computation is implemented.
+    fn markovian_conformance(
+        &self,
+        language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
+        k: usize,
+        metric: DistanceMetric,
     ) -> Result<Fraction>;
 }
 
@@ -84,10 +121,215 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
             ));
         };
 
-        // Step 3: Compute the distance between the abstractions
-        compute_uemsc_distance(&abstraction1, &abstraction2)
-            .context("Computing uEMSC distance between abstractions")
+        // Step 3: Compute the conformance between the abstractions
+        compute_uemsc_conformance(&abstraction1, &abstraction2)
+            .context("Computing uEMSC conformance between abstractions")
     }
+
+    fn markovian_conformance(
+        &self,
+        language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Result<Fraction> {
+        // Validate k
+        if k < 2 {
+            return Err(anyhow::anyhow!("k must be at least 2"));
+        }
+
+        // Step 1: Compute abstraction for the first language
+        let abstraction1 = compute_abstraction_for_log(self, k)
+            .context("Computing abstraction for first language (finite log)")?;
+
+        // Step 2: Before computing the abstraction for the second language we must
+        // make sure it uses the same activity labels for the same activities
+        let mut shared_key = self.get_activity_key().clone();
+        let mut language2 = language2;
+        let abstraction2 = if let Some(pn) = (&mut *language2 as &mut dyn Any)
+            .downcast_mut::<StochasticLabelledPetriNet>()
+        {
+            pn.translate_using_activity_key(&mut shared_key);
+            compute_abstraction_for_petri_net(pn, k)
+                .context("Computing abstraction for second language (Petri net)")?
+        } else if let Some(flog) = (&mut *language2 as &mut dyn Any)
+            .downcast_mut::<FiniteStochasticLanguage>()
+        {
+            flog.translate_using_activity_key(&mut shared_key);
+            compute_abstraction_for_log(flog, k)
+                .context("Computing abstraction for second language (finite log)")?
+        } else {
+            return Err(anyhow::anyhow!(
+                "markovian_conformance: unsupported type for second language"
+            ));
+        };
+
+        // Step 3: Compute the conformance between the abstractions depending on the metric
+        match metric {
+            DistanceMetric::Uemsc => {
+                let d = compute_uemsc_conformance(&abstraction1, &abstraction2)?;
+                // already returns the conformance score not the distance
+                Ok(d)
+            }
+            DistanceMetric::TotalVariation => {
+                let tv = compute_total_variation_distance(&abstraction1, &abstraction2)?;
+                let one = Fraction::from((1, 1));
+                Ok(&one - &tv)
+            }
+                    DistanceMetric::JensenShannon => {
+                let js = compute_jensen_shannon_distance(&abstraction1, &abstraction2)?;
+                let one = Fraction::from((1, 1));
+                Ok(&one - &js)
+            }
+            DistanceMetric::Hellinger => {
+                let h = compute_hellinger_distance(&abstraction1, &abstraction2)?;
+                let one = Fraction::from((1, 1));
+                Ok(&one - &h)
+            }
+
+        }
+    }
+}
+
+/// Compute the Jensen–Shannon distance between two abstractions.
+fn compute_jensen_shannon_distance(
+    abstraction1: &MarkovianAbstraction,
+    abstraction2: &MarkovianAbstraction,
+) -> Result<Fraction> {
+
+    // Helper: convert an exact or approximate Fraction to f64 quickly.
+    // For Exact fractions we compute n / d in double precision which is 
+    // good enough for a Jensen–Shannon distance that is approximated to 1 e-15.
+    #[inline]
+    fn frac_to_f64(fr: &Fraction) -> f64 {
+        if fr.is_zero() {
+            return 0.0;
+        }
+
+        // Try the fast path for approximate fractions first
+        if let Ok(v) = fr.extract_approx() {
+            return v;
+        }
+
+        // Exact fraction -> fall back to numerator / denominator conversion
+        if let Ok(exact) = fr.extract_exact() {
+            if let (Some(n), Some(d)) = (exact.numer(), exact.denom()) {
+                // Convert the first 53 bits of each part (f64 mantissa size).
+                let n_f = n.to_f64().unwrap_or(0.0);
+                let d_f = d.to_f64().unwrap_or(1.0);
+                return n_f / d_f;
+            }
+        }
+        0.0 // Should not happen, but keeps the compiler happy
+    }
+
+    #[inline]
+    fn n_log_n(x: f64) -> f64 {
+        if x <= 0.0 { 0.0 } else { x * x.log2() }
+    }
+
+    let mut h = 0.0;
+
+    // Keys from abstraction1
+    for (gamma, p1_frac) in &abstraction1.abstraction {
+        let p1 = frac_to_f64(p1_frac);
+        let p2 = abstraction2
+            .abstraction
+            .get(gamma)
+            .map(|f| frac_to_f64(f))
+            .unwrap_or(0.0);
+        if p1 + p2 == 0.0 {
+            continue;
+        }
+        let pq = p1 + p2;
+        h += n_log_n(p1) + n_log_n(p2) - n_log_n(pq) + pq;
+    }
+
+    // Keys only in abstraction2
+    for (gamma, p2_frac) in &abstraction2.abstraction {
+        if abstraction1.abstraction.contains_key(gamma) {
+            continue;
+        }
+        let p2 = frac_to_f64(p2_frac);
+        if p2 == 0.0 {
+            continue;
+        }
+        h += n_log_n(0.0) + n_log_n(p2) - n_log_n(p2) + p2; // pq == p2
+    }
+
+    h *= 0.5; // scale by 1/2
+
+    // Identical abstractions or tiny difference
+    if h <= 2.220_446_049_250_313e-16 {
+        return Ok(Fraction::from((0, 1)));
+    }
+
+    let d = h.sqrt();
+    const DEN: u64 = 1_000_000_000_000_000; // 1e15
+    let num = (d * DEN as f64).round() as u64;
+    Ok(Fraction::from((num, DEN)))
+}
+
+
+
+/// Compute the Hellinger distance between two abstractions.
+fn compute_hellinger_distance(
+    abstraction1: &MarkovianAbstraction,
+    abstraction2: &MarkovianAbstraction,
+) -> Result<Fraction> {
+    let zero = Fraction::from((0, 1));
+    let mut bc = Fraction::from((0, 1));
+
+    for (gamma, p1) in &abstraction1.abstraction {
+        let p2 = abstraction2.abstraction.get(gamma).unwrap_or(&zero);
+        // sqrt(p1 * p2)
+        let prod = p1 * p2;
+        if !prod.is_zero() {
+            bc += prod.sqrt_abs(15);
+        }
+    }
+    for (gamma, _) in &abstraction2.abstraction {
+        if abstraction1.abstraction.contains_key(gamma) {
+            continue;
+        }
+        // p1 = 0 for these keys -> contribution to BC is zero -> nothing to add
+    }
+    let one = Fraction::from((1, 1));
+    let h_sq = &one - &bc;
+    Ok(h_sq.sqrt_abs(15))
+}
+
+
+/// Compute the symmetric total-variation distance between two abstractions.
+fn compute_total_variation_distance(
+    abstraction1: &MarkovianAbstraction,
+    abstraction2: &MarkovianAbstraction,
+) -> Result<Fraction> {
+    if abstraction1.k != abstraction2.k {
+        return Err(anyhow::anyhow!(
+            "Cannot compare abstractions of different order: k1={}, k2={}",
+            abstraction1.k, abstraction2.k
+        ));
+    }
+
+    let mut diff_sum = Fraction::from((0, 1));
+    let zero = Fraction::from((0, 1));
+
+    // Iterate over union of keys; first pass abstraction1
+    for (gamma, p1) in &abstraction1.abstraction {
+        let p2 = abstraction2.abstraction.get(gamma).unwrap_or(&zero);
+        let d = (p1 - p2).abs();
+        diff_sum += d;
+    }
+    // Now add keys that are only in abstraction2
+    for (gamma, p2) in &abstraction2.abstraction {
+        if !abstraction1.abstraction.contains_key(gamma) {
+            diff_sum += p2.clone();
+        }
+    }
+
+    // Multiply by 1/2
+    diff_sum /= 2usize;
+    Ok(diff_sum)
 }
 
 /// This implements the calculation of the k-th order Stochastic Markovian abstraction
@@ -519,8 +761,8 @@ pub fn compute_abstraction_for_petri_net(
     Ok(MarkovianAbstraction { k, abstraction })
 }
 
-/// Compute the m^k-uEMSC distance between two Markovian abstractions
-pub fn compute_uemsc_distance(
+/// Compute the m^k-uEMSC conformance between two Markovian abstractions
+pub fn compute_uemsc_conformance(
     abstraction1: &MarkovianAbstraction,
     abstraction2: &MarkovianAbstraction,
 ) -> Result<Fraction> {
@@ -548,11 +790,11 @@ pub fn compute_uemsc_distance(
         }
     }
 
-    // Distance = 1 - positive_diff
+    // Conformance = 1 - positive_diff
     let one = Fraction::from((1, 1));
-    let distance = &one - &positive_diff;
+    let conformance = &one - &positive_diff;
 
-    Ok(distance)
+    Ok(conformance)
 }
 
 #[cfg(test)]
