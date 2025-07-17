@@ -7,9 +7,11 @@ use anyhow::{Context, Result};
 use num_traits::ToPrimitive;
 
 use crate::{
+    ebi_traits::{ebi_trait_semantics::Semantics, ebi_trait_stochastic_semantics::StochasticSemantics},
     ebi_framework::activity_key::TranslateActivityKey,
     ebi_objects::finite_stochastic_language::FiniteStochasticLanguage,
     ebi_objects::stochastic_labelled_petri_net::StochasticLabelledPetriNet,
+    ebi_objects::labelled_petri_net::LPNMarking,
     ebi_objects::stochastic_nondeterministic_finite_automaton::{
         StochasticNondeterministicFiniteAutomaton as Snfa,
         State as SnfaState,
@@ -19,9 +21,11 @@ use crate::{
         ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage,
         ebi_trait_queriable_stochastic_language::EbiTraitQueriableStochasticLanguage,
     },
-    marking::Marking,
+
     math::fraction::{Fraction, MaybeExact},
     math::traits::{Zero, Signed},
+    techniques::bounded::Bounded,
+    techniques::sample::Sampler,
 };
 
 /// Supported distance metrics for Markovian abstraction comparison.
@@ -38,6 +42,10 @@ pub enum DistanceMetric {
     /// Hellinger distance.
     Hellinger,
 }
+
+/// Default number of traces to sample when falling back to simulation for
+/// unbounded Petri nets. (maybe optional parameter later)
+const DEFAULT_SAMPLE_SIZE: usize = 10_000;
 
 pub trait StochasticMarkovianAbstraction {
     /// Compare `self` with another stochastic language using the selected
@@ -96,9 +104,22 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
         let abstraction2 = if let Some(pn) = (&mut *language2 as &mut dyn Any)
             .downcast_mut::<StochasticLabelledPetriNet>()
         {
-            pn.translate_using_activity_key(&mut shared_key);
-            compute_abstraction_for_petri_net(pn, k)
-                .context("Computing abstraction for second language (Petri net)")?
+            // If the Petri net is unbounded, fall back to random sampling.
+            if !pn.bounded()? {
+                log::warn!("Model is unbounded; falling back to random sampling. If a livelock is also present this may not terminate.");
+                // Sample a finite stochastic language of DEFAULT_SAMPLE_SIZE traces
+                let sampled: FiniteStochasticLanguage = pn
+                    .sample(DEFAULT_SAMPLE_SIZE)
+                    .context("Sampling unbounded Petri net")?;
+                let mut boxed_sample: FiniteStochasticLanguage = sampled;
+                boxed_sample.translate_using_activity_key(&mut shared_key);
+                compute_abstraction_for_log(&boxed_sample, k)
+                    .context("Computing abstraction for second language (sampled log)")?
+            } else {
+                pn.translate_using_activity_key(&mut shared_key);
+                compute_abstraction_for_petri_net(pn, k)
+                    .context("Computing abstraction for second language (Petri net)")?
+            }
         } else if let Some(flog) = (&mut *language2 as &mut dyn Any)
             .downcast_mut::<FiniteStochasticLanguage>()
         {
@@ -382,72 +403,64 @@ fn compute_multiset_k_trimmed_subtraces_iterative(trace: &[String], k: usize) ->
 fn build_embedded_snfa(net: &StochasticLabelledPetriNet) -> Result<Snfa> {
     use std::collections::VecDeque;
 
-    // Create a new SNFA with empty states list
+    // Create a new SNFA without the default initial state
     let mut snfa = Snfa::new();
-    snfa.states.clear(); // Remove the initial state
-    
-    // Map reachable markings to state indices
-    let mut marking2idx: HashMap<Marking, usize> = HashMap::new();
-    let mut queue: VecDeque<Marking> = VecDeque::new();
-    
-    // Initialize with initial marking
-    let initial_marking = net.get_initial_marking().clone();
+    snfa.states.clear();
+
+    // Reachability exploration queue
+    let mut marking2idx: HashMap<LPNMarking, usize> = HashMap::new();
+    let mut queue: VecDeque<LPNMarking> = VecDeque::new();
+
+    // Insert the initial state of the Petri net
+    let initial_marking = net
+        .get_initial_state()
+        .context("SLPN has no initial state")?;
     marking2idx.insert(initial_marking.clone(), 0);
-    snfa.states.push(SnfaState { transitions: vec![], p_final: Fraction::from((0, 1)) });
-    queue.push_back(initial_marking.clone());
+    snfa.states.push(SnfaState {
+        transitions: vec![],
+        p_final: Fraction::from((0, 1)),
+    });
+    queue.push_back(initial_marking);
 
-    while let Some(marking) = queue.pop_front() {
-        let src_idx = *marking2idx.get(&marking).unwrap();
+    while let Some(state) = queue.pop_front() {
+        let src_idx = *marking2idx.get(&state).unwrap();
 
-        // Collect enabled transitions and their total weight
-        let mut enabled: Vec<(usize, Fraction)> = vec![]; // (transition index, weight)
-        let mut weight_sum = Fraction::from((0, 1));
-        let n_transitions = net.weights.len();
-        for t in 0..n_transitions {
-            if is_enabled(&net, &marking, t) {
-                let weight = net.weights[t].clone();
-                enabled.push((t, weight.clone()));
-                weight_sum += &weight;
-            }
-        }
-
-        if enabled.is_empty() {
-            // Deadlock marking -> p_final = 1
+        // Collect enabled transitions and the total enabled weight in this state
+        let enabled_transitions = net.get_enabled_transitions(&state);
+        if enabled_transitions.is_empty() {
+            // Deadlock state -> make it final with probability 1
             snfa.states[src_idx].p_final = Fraction::from((1, 1));
             continue;
         }
 
-        for (t, w) in enabled {
-            // Compute probability weight
+        let weight_sum = net.get_total_weight_of_enabled_transitions(&state)?;
+
+        for &t in &enabled_transitions {
+            let w = net.get_transition_weight(&state, t).clone();
             let prob = &w / &weight_sum;
-            
-            // Fire transition
-            let new_marking = fire_transition(&net, &marking, t)?;
-            
-            // Handle new marking
-            let tgt_idx;
-            if !marking2idx.contains_key(&new_marking) {
-                // Create new state
+
+            // Fire transition (creates a successor state)
+            let mut next_state = state.clone();
+            net.execute_transition(&mut next_state, t)?;
+
+            // Map / enqueue successor
+            let tgt_idx = *marking2idx.entry(next_state.clone()).or_insert_with(|| {
                 let idx = snfa.states.len();
-                snfa.states.push(SnfaState { 
+                snfa.states.push(SnfaState {
                     transitions: vec![],
-                    p_final: Fraction::from((0, 1)), // Not final by default
+                    p_final: Fraction::from((0, 1)),
                 });
-                marking2idx.insert(new_marking.clone(), idx);
-                queue.push_back(new_marking.clone());
-                tgt_idx = idx;
-            } else {
-                tgt_idx = *marking2idx.get(&new_marking).unwrap();
-            };
+                queue.push_back(next_state.clone());
+                idx
+            });
 
-            // Use only the transition label from the Petri net without state information
+            // Transition label (empty string for tau transition)
             let label = if let Some(a) = net.get_transition_label(t) {
-                a.to_string() // Keep just the plain transition label
+                a.to_string()
             } else {
-                "".to_string() // Tau transition
+                "".to_string()
             };
 
-            // Add the transition to the source state
             snfa.states[src_idx].transitions.push(SnfaTransition {
                 target: tgt_idx,
                 label,
@@ -456,35 +469,9 @@ fn build_embedded_snfa(net: &StochasticLabelledPetriNet) -> Result<Snfa> {
         }
     }
 
-    // Set the initial state to 0
+    // The first discovered marking is the initial state of the SNFA
     snfa.initial = 0;
     Ok(snfa)
-}
-
-// Helper function to check if a transition is enabled in a given marking
-fn is_enabled(net: &StochasticLabelledPetriNet, marking: &Marking, t: usize) -> bool {
-    for (pos, place) in net.transition2input_places[t].iter().enumerate() {
-        let card = net.transition2input_places_cardinality[t][pos] as u64;
-        if marking.get_place2token()[*place] < card {
-            return false;
-        }
-    }
-    true
-}
-
-fn fire_transition(net: &StochasticLabelledPetriNet, marking: &Marking, t: usize) -> Result<Marking> {
-    let mut new_m = marking.clone();
-    // Consume tokens
-    for (i, place) in net.transition2input_places[t].iter().enumerate() {
-        let card = net.transition2input_places_cardinality[t][i] as u64;
-        new_m.decrease(*place, card)?;
-    }
-    // Produce tokens
-    for (i, place) in net.transition2output_places[t].iter().enumerate() {
-        let card = net.transition2output_places_cardinality[t][i] as u64;
-        new_m.increase(*place, card)?;
-    }
-    Ok(new_m)
 }
 
 // Patching - assumes SNFA is already tau-free
