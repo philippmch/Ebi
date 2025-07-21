@@ -25,6 +25,7 @@ use crate::{
     math::fraction::{Fraction, MaybeExact},
     math::traits::{Zero, Signed},
     techniques::bounded::Bounded,
+    techniques::livelock_patch,
     techniques::sample::Sampler,
 };
 
@@ -642,8 +643,11 @@ pub fn compute_abstraction_for_petri_net(
         return Err(anyhow::anyhow!("k must be at least 2 for Markovian abstraction"));
     }
 
+    // 0.5 Patch bounded livelocks by adding timeout escapes (δ = 1e-4) (maybe make optional parameter later)
+    let patched_net = livelock_patch::patch_livelocks(petri_net, Fraction::from((1, 10000)))?;
+
     // 1 Build embedded SNFA
-    let mut snfa_raw = build_embedded_snfa(petri_net)?;
+    let mut snfa_raw = build_embedded_snfa(&patched_net)?;
 
     // 1.1 Remove tau transitions
     snfa_raw.remove_tau_transitions();
