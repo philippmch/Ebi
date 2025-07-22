@@ -298,7 +298,7 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
     input_helps: &[
         "A finite stochastic language (log) to compare.",
         "A queriable stochastic language (model) to compare.",
-        "The order k of the Markovian abstraction (should be at least 2).",
+        "The order k of the Markovian abstraction (should be at least 1).",
         "Distance metric: one of uemsc | tv | js | hellinger.",
     ],
     execute: |mut inputs, _| {

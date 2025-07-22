@@ -90,8 +90,8 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
         metric: DistanceMetric,
     ) -> Result<Fraction> {
         // Validate k
-        if k < 2 {
-            return Err(anyhow::anyhow!("k must be at least 2"));
+        if k < 1 {
+            return Err(anyhow::anyhow!("k must be at least 1"));
         }
 
         // Step 1: Compute abstraction for the first language
@@ -312,8 +312,8 @@ pub fn compute_abstraction_for_log(
     k: usize,
 ) -> Result<MarkovianAbstraction> {
     // Validate k
-    if k < 2 {
-        return Err(anyhow::anyhow!("k must be at least 2 for Markovian abstraction"));
+    if k < 1 {
+        return Err(anyhow::anyhow!("k must be at least 1 for Markovian abstraction"));
     }
 
     // Initialize f_l^k which stores the expected number of occurrences of each subtrace
@@ -639,8 +639,8 @@ pub fn compute_abstraction_for_petri_net(
     petri_net: &StochasticLabelledPetriNet,
     k: usize,
 ) -> Result<MarkovianAbstraction> {
-    if k < 2 {
-        return Err(anyhow::anyhow!("k must be at least 2 for Markovian abstraction"));
+    if k < 1 {
+        return Err(anyhow::anyhow!("k must be at least 1 for Markovian abstraction"));
     }
 
     // 0.5 Patch bounded livelocks by adding timeout escapes (δ = 1e-4) (maybe make optional parameter later)
@@ -797,9 +797,9 @@ mod tests {
         let file_content = fs::read_to_string("testfiles/simple_markovian_abstraction.slpn").unwrap();
         let petri_net = file_content.parse::<StochasticLabelledPetriNet>().unwrap();
         
-        // Check that k < 2 is rejected
-        let result = compute_abstraction_for_petri_net(&petri_net, 1);
-        assert!(result.is_err(), "Should reject k < 2");
+        // Check that k < 1 is rejected (k = 0)
+        let result = compute_abstraction_for_petri_net(&petri_net, 0);
+        assert!(result.is_err(), "Should reject k < 1");
         
         // Compute abstraction with k=2
         let abstraction = compute_abstraction_for_petri_net(&petri_net, 2).unwrap();
