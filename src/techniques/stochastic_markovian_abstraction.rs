@@ -11,6 +11,7 @@ use num_traits::ToPrimitive;
 use crate::{
     ebi_traits::{ebi_trait_semantics::Semantics, ebi_trait_stochastic_semantics::StochasticSemantics},
     ebi_framework::activity_key::TranslateActivityKey,
+    ebi_framework::activity_key::ActivityKey,
     ebi_objects::finite_stochastic_language::FiniteStochasticLanguage,
     ebi_objects::stochastic_labelled_petri_net::StochasticLabelledPetriNet,
     ebi_objects::labelled_petri_net::LPNMarking,
@@ -321,6 +322,7 @@ pub fn compute_abstraction_for_log(
     // Initialize f_l^k which stores the expected number of occurrences of each subtrace
     let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::default();
 
+    let mut activity_key_clone = log.get_activity_key().clone();
     // For each trace in the log with its probability
     for (trace, probability) in log.iter_trace_probability() {
         // Create a Vec<String> from the Vec<Activity>
@@ -329,7 +331,7 @@ pub fn compute_abstraction_for_log(
             .collect();
 
         // Compute M_σ^k for this trace (k-th order multiset Markovian abstraction)
-        let m_sigma_k = compute_multiset_abstraction_for_trace(&string_trace, k);
+        let m_sigma_k = compute_multiset_abstraction_for_trace_with_key(&string_trace, k, &mut activity_key_clone);
 
         // Add contribution to f_l^k
         for (subtrace, occurrences) in m_sigma_k {
@@ -368,35 +370,75 @@ pub fn compute_abstraction_for_log(
 }
 
 /// Compute the multiset of k-trimmed subtraces for a given trace
-/// This implements M_σ^k = S_{+σ-}^k
-fn compute_multiset_abstraction_for_trace(trace: &[String], k: usize) -> HashMap<Arc<[String]>, usize> {
-    // Create a new trace with start '+' and end '-' markers
-    let mut augmented_trace = Vec::with_capacity(trace.len() + 2);
-    augmented_trace.push("+".to_string());
-    augmented_trace.extend(trace.iter().cloned());
-    augmented_trace.push("-".to_string());
+fn compute_multiset_abstraction_for_trace_with_key(trace: &[String], k: usize, key: &mut ActivityKey) -> HashMap<Arc<[String]>, usize> {
+    // Convert labels to IDs and add start/end markers in ID space
+    let mut augmented_ids: Vec<u32> = Vec::with_capacity(trace.len() + 2);
+    {
+        let act = key.process_activity("+");
+        augmented_ids.push(key.get_id_from_activity(act) as u32);
+    }
+    for lbl in trace {
+        let act = key.process_activity(lbl);
+        augmented_ids.push(key.get_id_from_activity(act) as u32);
+    }
+    {
+        let act = key.process_activity("-");
+        augmented_ids.push(key.get_id_from_activity(act) as u32);
+    }
 
-    // Compute S_σ^k for the trace
-    compute_multiset_k_trimmed_subtraces_iterative(&augmented_trace, k)
+    // Compute multiset over IDs
+    let id_multiset = compute_multiset_k_trimmed_subtraces_iterative_ids(&augmented_ids, k);
+
+    // Reconstruct String subtrace keys via the reverse map
+    let mut result: HashMap<Arc<[String]>, usize> = HashMap::default();
+    result.reserve(id_multiset.len());
+    for (sub_ids, cnt) in id_multiset {
+        let strings: Vec<String> = sub_ids.iter().map(|&id| {
+            let act = key.get_activity_by_id(id as usize);
+            key.deprocess_activity(&act).to_string()
+        }).collect();
+        result.insert(Arc::from(strings), cnt);
+    }
+    result
 }
 
-/// Compute the multiset of k-trimmed subtraces for a given trace
-/// This implements S_σ^k, but uses an iterative approach rather than recursion
-/// to avoid stack overflow for very long traces.
-fn compute_multiset_k_trimmed_subtraces_iterative(trace: &[String], k: usize) -> HashMap<Arc<[String]>, usize> {
-    let mut result = HashMap::default();
+/// Operates on a slice of `u32` activity IDs and returns a
+/// multiset keyed by `Arc<[u32]>`. This avoids heap traffic except when a new
+/// *unique* subtrace is inserted into the map.
+fn compute_multiset_k_trimmed_subtraces_iterative_ids(
+    trace: &[u32],
+    k: usize,
+) -> HashMap<Arc<[u32]>, usize> {
+    let mut result: HashMap<Arc<[u32]>, usize> = HashMap::default();
 
     if trace.len() <= k {
-        // If trace length <= k, add the whole trace once - directly create Arc
-        let arc = Arc::<[String]>::from(trace);
-        result.insert(arc, 1);
+        result.insert(Arc::from(trace.to_owned()), 1);
         return result;
     }
 
-    // Compute k-length subtraces using sliding window
-    for window in trace.windows(k) {
-        let arc = Arc::<[String]>::from(window.to_vec());
-        *result.entry(arc).or_insert(0) += 1; // Increment count for this subtrace
+    let mut ring: Vec<u32> = Vec::with_capacity(k);
+    ring.extend_from_slice(&trace[..k]);
+    let mut head: usize = 0; // index of the oldest element
+
+    // Reusable key construction
+    let mut tmp: Vec<u32> = Vec::with_capacity(k);
+    // Helper to build an Arc key representing the current window
+    let make_key = |ring: &Vec<u32>, head: usize, tmp: &mut Vec<u32>| -> Arc<[u32]> {
+        tmp.clear();
+        tmp.extend_from_slice(&ring[head..]);
+        tmp.extend_from_slice(&ring[..head]);
+        Arc::from(tmp.clone().into_boxed_slice())
+    };
+
+    // Insert first window
+    result.insert(make_key(&ring, head, &mut tmp), 1);
+
+    // Slide through the trace
+    for &next_id in &trace[k..] {
+        ring[head] = next_id;           // overwrite the oldest
+        head = (head + 1) % k;          // advance head
+        let key = make_key(&ring, head, &mut tmp);
+        *result.entry(key).or_insert(0) += 1;
     }
 
     result
