@@ -525,14 +525,17 @@ fn patch_snfa(snfa: &Snfa) -> Snfa {
     }
 }
 
-// Build transition matrix
-fn build_delta(snfa: &Snfa) -> Vec<Vec<Fraction>> {
+// Build sparse transition matrix
+fn build_delta(snfa: &Snfa) -> Vec<HashMap<usize, Fraction>> {
     let n = snfa.states.len();
-    let mut delta = vec![vec![Fraction::from((0, 1)); n]; n];
-    
+    let mut delta = vec![HashMap::<usize, Fraction>::default(); n];
+
     for (i, state) in snfa.states.iter().enumerate() {
         for t in &state.transitions {
-            delta[i][t.target] += &t.probability;
+            delta[i]
+                .entry(t.target)
+                .and_modify(|v| *v += &t.probability)
+                .or_insert(t.probability.clone());
         }
     }
     delta
@@ -822,15 +825,20 @@ pub fn compute_abstraction_for_petri_net(
     // 3 Build matrix and solve for x
     let n = snfa.states.len();
     // Build sparse A = (I − Delta)^T
-    let mut a_sparse: Vec<HashMap<usize, Fraction>> = vec![HashMap::default(); n];
     let delta = build_delta(&snfa);
+    let mut a_sparse: Vec<HashMap<usize, Fraction>> = vec![HashMap::default(); n];
+
     for i in 0..n {
-        for j in 0..n {
-            let identity = if i == j { Fraction::from((1, 1)) } else { Fraction::from((0, 1)) };
-            let val = &identity - &delta[i][j];
-            if !val.is_zero() {
-                a_sparse[j].insert(i, val); // transpose while filling
-            }
+        // Identity contribution
+        a_sparse[i].insert(i, Fraction::from((1, 1)));
+
+        // Subtract row i of Delta into column i of A
+        for (&j, p) in &delta[i] {
+            // A[j,i] = I[j,i] − Delta[i,j]
+            a_sparse[j]
+                .entry(i)
+                .and_modify(|v| *v -= p)
+                .or_insert_with(|| -p.clone());
         }
     }
     let mut b = vec![Fraction::from((0, 1)); n];
