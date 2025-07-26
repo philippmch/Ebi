@@ -1,5 +1,7 @@
 use std::any::Any;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
+use rayon::prelude::*;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -317,7 +319,7 @@ pub fn compute_abstraction_for_log(
     }
 
     // Initialize f_l^k which stores the expected number of occurrences of each subtrace
-    let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::new();
+    let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::default();
 
     // For each trace in the log with its probability
     for (trace, probability) in log.iter_trace_probability() {
@@ -355,7 +357,7 @@ pub fn compute_abstraction_for_log(
     }
 
     // Normalize f_l^k to get m_l^k
-    let mut abstraction = HashMap::new();
+    let mut abstraction = HashMap::default();
     for (subtrace, count) in f_l_k {
         let count_ref: &Fraction = &count;
         let total_ref: &Fraction = &total;
@@ -382,7 +384,7 @@ fn compute_multiset_abstraction_for_trace(trace: &[String], k: usize) -> HashMap
 /// This implements S_σ^k, but uses an iterative approach rather than recursion
 /// to avoid stack overflow for very long traces.
 fn compute_multiset_k_trimmed_subtraces_iterative(trace: &[String], k: usize) -> HashMap<Arc<[String]>, usize> {
-    let mut result = HashMap::new();
+    let mut result = HashMap::default();
 
     if trace.len() <= k {
         // If trace length <= k, add the whole trace once - directly create Arc
@@ -409,7 +411,7 @@ fn build_embedded_snfa(net: &StochasticLabelledPetriNet) -> Result<Snfa> {
     snfa.states.clear();
 
     // Reachability exploration queue
-    let mut marking2idx: HashMap<LPNMarking, usize> = HashMap::new();
+    let mut marking2idx: HashMap<LPNMarking, usize> = HashMap::default();
     let mut queue: VecDeque<LPNMarking> = VecDeque::new();
 
     // Insert the initial state of the Petri net
@@ -536,14 +538,164 @@ fn build_delta(snfa: &Snfa) -> Vec<Vec<Fraction>> {
     delta
 }
 
-// Solve (I − Δ)ᵀ x = e₊ using exact Gaussian elimination on Fractions (needs more efficient implementation, TODO)
-fn solve_linear_system(a: &mut [Vec<Fraction>], b: &mut [Fraction]) -> Result<Vec<Fraction>> {
+/// Sparse exact Gaussian elimination where each row is a **sorted** Vec<(usize, Fraction)>.
+/// We convert the incoming HashMap representation once and then run a cache friendly merge based
+/// elimination (A := A - factor * pivot).
+fn solve_sparse_linear_system_optimized(a_hash: &mut [HashMap<usize, Fraction>], mut b: Vec<Fraction>) -> Result<Vec<Fraction>> {
+    // Convert the incoming HashMap rows into sorted vec rows
+    fn to_vec_rows(a: &mut [HashMap<usize, Fraction>]) -> Vec<Vec<(usize, Fraction)>> {
+        a.iter_mut()
+            .map(|row| {
+                let mut v: Vec<(usize, Fraction)> = row.drain().collect();
+                v.sort_by_key(|(c, _)| *c);
+                v
+            })
+            .collect()
+    }
+
+    // Binary search helper
+    fn find_col(row: &[(usize, Fraction)], col: usize) -> Option<usize> {
+        row.binary_search_by_key(&col, |(c, _)| *c).ok()
+    }
+
+    /// target = target - factor * pivot   (skips column i)
+    fn saxpy_row(target: &mut Vec<(usize, Fraction)>, i: usize, pivot: &[(usize, Fraction)], factor: &Fraction) {
+        let mut out = Vec::with_capacity(target.len() + pivot.len());
+        let mut t = 0;
+        let mut p = 0;
+        while t < target.len() || p < pivot.len() {
+            match (target.get(t), pivot.get(p)) {
+                (Some(&(c_t, ref v_t)), Some(&(c_p, ref v_p))) if c_t == c_p => {
+                    if c_t != i {
+                        let mut new_val = v_t.clone();
+                        new_val -= &(factor * v_p);
+                        if !new_val.is_zero() {
+                            out.push((c_t, new_val));
+                        }
+                    }
+                    t += 1;
+                    p += 1;
+                }
+                (Some(&(c_t, ref v_t)), Some(&(c_p, _))) if c_t < c_p => {
+                    if c_t != i {
+                        out.push((c_t, v_t.clone()));
+                    }
+                    t += 1;
+                }
+                (Some(&(c_t, ref v_t)), None) => {
+                    if c_t != i {
+                        out.push((c_t, v_t.clone()));
+                    }
+                    t += 1;
+                }
+                (None, Some(&(c_p, ref v_p))) | (Some(&(_, _)), Some(&(c_p, ref v_p))) => {
+                    // c_p < c_t  OR target exhausted
+                    if c_p != i {
+                        let new_val = -(factor * v_p);
+                        if !new_val.is_zero() {
+                            out.push((c_p, new_val));
+                        }
+                    }
+                    p += 1;
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        out.shrink_to_fit();
+        *target = out;
+    }
+    
+    // Convert matrix once
+    let mut a: Vec<Vec<(usize, Fraction)>> = to_vec_rows(a_hash);
+    let n = b.len();
+
+    for i in 0..n {
+        // 1. Pivot search (find first row r >= i with non zero col i)
+        let pivot = (i..n)
+            .find(|&r| {
+                find_col(&a[r], i)
+                    .map_or(false, |idx| !a[r][idx].1.is_zero())
+            })
+            .ok_or_else(|| anyhow::anyhow!("Matrix is singular"))?;
+
+        if pivot != i {
+            a.swap(i, pivot);
+            b.swap(i, pivot);
+        }
+
+        // 2. Normalize pivot row so diagonal becomes 1
+        let diag_idx = find_col(&a[i], i).expect("pivot exists");
+        let inv = a[i][diag_idx].1.clone().recip();
+        for &mut (_, ref mut v) in &mut a[i] {
+            *v *= &inv;
+        }
+        b[i] *= &inv;
+
+        // 3. Split mutable slice around pivot row
+        let (left, rest) = a.split_at_mut(i);
+        let (pivot_row, below) = rest.split_first_mut().expect("pivot row");
+        let pivot_ref: &[(usize, Fraction)] = &pivot_row[..];
+        let pivot_b = b[i].clone();
+
+        // Thread local updates for RHS
+        let mut updates: Vec<(usize, Fraction)> = Vec::with_capacity(left.len() + below.len());
+
+        // rows above
+        updates.extend(
+            left.par_iter_mut()
+                .enumerate()
+                .filter_map(|(r, row)| {
+                    find_col(row, i).map(|idx| {
+                        let factor = row[idx].1.clone();
+                        row[idx].1 = Fraction::zero(); // lazy zeroing avoids shift
+                        if factor.is_zero() {
+                            None
+                        } else {
+                            saxpy_row(row, i, pivot_ref, &factor);
+                            Some((r, factor))
+                        }
+                    }).flatten()
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // rows below
+        updates.extend(
+            below.par_iter_mut()
+                .enumerate()
+                .filter_map(|(off, row)| {
+                    let r = i + 1 + off;
+                    find_col(row, i).map(|idx| {
+                        let factor = row[idx].1.clone();
+                        row[idx].1 = Fraction::zero();
+                        if factor.is_zero() {
+                            None
+                        } else {
+                            saxpy_row(row, i, pivot_ref, &factor);
+                            Some((r, factor))
+                        }
+                    }).flatten()
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // Apply RHS updates sequentially
+        for (r, factor) in updates {
+            b[r] -= &factor * &pivot_b;
+        }
+    }
+
+    Ok(b)
+}
+
+/// Naive sparse Gaussian elimination for Fraction matrices represented as Vec<HashMap<usize, Fraction>>
+fn solve_sparse_linear_system(a: &mut [HashMap<usize, Fraction>], mut b: Vec<Fraction>) -> Result<Vec<Fraction>> {
     let n = b.len();
     // Forward elimination
     for i in 0..n {
         // Find pivot
         let mut pivot = i;
-        while pivot < n && a[pivot][i].is_zero() {
+        while pivot < n && a[pivot].get(&i).map_or(true, |v| v.is_zero()) {
             pivot += 1;
         }
         if pivot == n {
@@ -554,30 +706,42 @@ fn solve_linear_system(a: &mut [Vec<Fraction>], b: &mut [Fraction]) -> Result<Ve
             b.swap(i, pivot);
         }
         // Normalize row i
-        let inv = a[i][i].clone().recip();
-        for j in i..n {
-            a[i][j] *= &inv;
+        let inv = a[i].get(&i).unwrap().clone().recip();
+        // scale row i
+        let keys: Vec<usize> = a[i].keys().cloned().collect();
+        for j in keys {
+            if let Some(val) = a[i].get_mut(&j) {
+                *val *= &inv;
+            }
         }
         b[i] *= &inv;
+        let pivot_b = b[i].clone();
         // Eliminate other rows
         for r in 0..n {
             if r == i { continue; }
-            let factor = a[r][i].clone();
-            if factor.is_zero() { continue; }
-            for c in i..n {
-                let product = &factor * &a[i][c];
-                a[r][c] = &a[r][c] - &product;
+            if let Some(factor_val) = a[r].get(&i).cloned() {
+                if !factor_val.is_zero() {
+                    // subtract factor * row_i from row_r
+                    let keys: Vec<(usize, Fraction)> = a[i].iter().map(|(k,v)| (*k, v.clone())).collect();
+                    for (c, val_i) in keys {
+                        let product = &factor_val * &val_i;
+                        let entry = a[r].entry(c).or_insert_with(Fraction::zero);
+                        *entry = &*entry - &product;
+                        if entry.is_zero() {
+                            a[r].remove(&c);
+                        }
+                    }
+                    b[r] -= &factor_val * &pivot_b;
+                }
             }
-            b[r] -= &factor * &b[i];
         }
     }
     Ok(b.to_vec())
 }
 
-// Expected frequencies
 fn compute_phi(snfa: &Snfa, k: usize) -> Vec<HashMap<Arc<[String]>, Fraction>> {
     let n = snfa.states.len();
-    let mut phi: Vec<HashMap<Arc<[String]>, Fraction>> = vec![HashMap::new(); n];
+    let mut phi: Vec<HashMap<Arc<[String]>, Fraction>> = vec![HashMap::default(); n];
 
     // DFS to compute for each state and subtrace
     fn dfs(
@@ -656,28 +820,34 @@ pub fn compute_abstraction_for_petri_net(
     let snfa = patch_snfa(&snfa_raw);
 
     // 3 Build matrix and solve for x
+    let n = snfa.states.len();
+    // Build sparse A = (I − Delta)^T
+    let mut a_sparse: Vec<HashMap<usize, Fraction>> = vec![HashMap::default(); n];
     let delta = build_delta(&snfa);
-    let n = delta.len();
-    let mut a: Vec<Vec<Fraction>> = vec![vec![Fraction::from((0, 1)); n]; n];
-    // A = (I − Δ)ᵀ
     for i in 0..n {
         for j in 0..n {
             let identity = if i == j { Fraction::from((1, 1)) } else { Fraction::from((0, 1)) };
             let val = &identity - &delta[i][j];
-            a[j][i] = val; // transpose while filling
+            if !val.is_zero() {
+                a_sparse[j].insert(i, val); // transpose while filling
+            }
         }
     }
     let mut b = vec![Fraction::from((0, 1)); n];
     b[snfa.initial] = Fraction::from((1, 1)); // e₊
-    let mut a_ref: Vec<Vec<Fraction>> = a.into_iter().map(|row| row.into_iter().collect()).collect();
-    let mut b_ref = b.clone();
-    let x = solve_linear_system(&mut a_ref, &mut b_ref)?;
+    let mut a_ref = a_sparse;
+    let x = if n < 100{
+        // small matrices -> simpler hash map solver avoids conversion overhead
+        solve_sparse_linear_system(&mut a_ref, b)?
+    } else {
+        solve_sparse_linear_system_optimized(&mut a_ref, b)?
+    };
 
-    // 4 Compute φ for each state
+    // 4 Compute Phi for each state
     let phi = compute_phi(&snfa, k);
 
     // 5 Compute f_l^k
-    let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::new();
+    let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::default();
     for (q, map) in phi.iter().enumerate() {
         for (gamma, phi_val) in map {
             let contribution = &x[q] * phi_val;
@@ -692,7 +862,7 @@ pub fn compute_abstraction_for_petri_net(
     for v in f_l_k.values() {
         total += v;
     }
-    let mut abstraction = HashMap::new();
+    let mut abstraction = HashMap::default();
     for (gamma, val) in f_l_k {
         abstraction.insert(gamma, &val / &total);
     }
@@ -760,7 +930,7 @@ mod tests {
         assert_eq!(abstraction.abstraction.len(), 8, "Should be exactly 8 entries");
         
         // map for checking
-        let mut check: std::collections::HashMap<String, Fraction> = std::collections::HashMap::new();
+        let mut check: std::collections::HashMap<String, Fraction> = std::collections::HashMap::default();
         for (subtrace, prob) in abstraction.abstraction.iter() {
             let key = subtrace.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
             println!("{:<12} : {}", key, prob);
