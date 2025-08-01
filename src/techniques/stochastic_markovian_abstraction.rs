@@ -12,6 +12,7 @@ use crate::{
     ebi_traits::{ebi_trait_semantics::Semantics, ebi_trait_stochastic_semantics::StochasticSemantics},
     ebi_framework::activity_key::TranslateActivityKey,
     ebi_framework::activity_key::ActivityKey,
+    ebi_framework::activity_key::HasActivityKey,
     ebi_objects::finite_stochastic_language::FiniteStochasticLanguage,
     ebi_objects::stochastic_labelled_petri_net::StochasticLabelledPetriNet,
     ebi_objects::labelled_petri_net::LPNMarking,
@@ -784,59 +785,100 @@ fn solve_sparse_linear_system(a: &mut [HashMap<usize, Fraction>], mut b: Vec<Fra
     Ok(b.to_vec())
 }
 
-fn compute_phi(snfa: &Snfa, k: usize) -> Vec<HashMap<Arc<[String]>, Fraction>> {
+/// Compute Phi maps using integer label IDs for efficiency.
+/// Returns Vec indexed by start state q, each mapping Arc<[u32]> -> Fraction.
+fn compute_phi_ids(snfa: &Snfa, k: usize, key: &mut ActivityKey) -> Vec<HashMap<Arc<[u32]>, Fraction>> {
     let n = snfa.states.len();
-    let mut phi: Vec<HashMap<Arc<[String]>, Fraction>> = vec![HashMap::default(); n];
+    // Compute numeric IDs for "+" and "-" for quick comparisons
+    let plus_act = key.process_activity("+");
+    let id_plus = key.get_id_from_activity(plus_act) as u32;
+    let minus_act = key.process_activity("-");
+    let id_minus = key.get_id_from_activity(minus_act) as u32;
+    let mut phi: Vec<HashMap<Arc<[u32]>, Fraction>> = vec![HashMap::default(); n];
 
-    // DFS to compute for each state and subtrace
-    fn dfs(
-        start_idx: usize,
-        cur_idx: usize,
+    // Memoisation cache mapping (state, remaining_len) -> suffix map
+    // Suffix map: subtrace (starting at the first symbol that leaves the current state) -> probability
+    type SuffixMap = HashMap<Arc<[u32]>, Fraction>;
+    // Cache stores Arc<SuffixMap> so a hit clones only the pointer
+    let mut cache: HashMap<(usize, usize), Arc<SuffixMap>> = HashMap::default();
+
+    // Recursively collect every suffix of length <= remaining that can be produced
+    // from state_idx, together with its probability relative to the current state.
+    // The probabilities stored in the map do not include any prefix probability.
+    // This allows us to multiply the prefix probability later and still reuse the suffixes.
+    fn collect_suffixes(
+        state_idx: usize,
+        remaining: usize,
         snfa: &Snfa,
-        phi: &mut Vec<HashMap<Arc<[String]>, Fraction>>,
-        path: &mut Vec<String>,
-        k: usize,
-        f_q: &Fraction                      // current path weight
-    ) {
-        // If the run has terminated with ‘-’ before reaching k,
-        // store the whole trace and stop exploring.
-        // The first symbol must be ‘+’; otherwise this is just a suffix inside a longer run and must be ignored.
-        if matches!(path.last(), Some(s) if s == "-")
-            && path.len() <= k
-            && matches!(path.first(), Some(p) if p == "+")
-        {
-            let subtrace = Arc::from(&path[..]);
-            let entry = phi[start_idx]
-                .entry(subtrace)
-                .or_insert_with(|| Fraction::from((0, 1)));
-            *entry += f_q;                 // weight already includes ‘-’
-            return;                        // nothing follows after ‘-’
+        key: &mut ActivityKey,
+        cache: &mut HashMap<(usize, usize), Arc<SuffixMap>>,
+    ) -> Arc<SuffixMap> {
+        // Fast path -> already computed
+        if let Some(m) = cache.get(&(state_idx, remaining)) {
+            return m.clone();
         }
 
-        // Only accumulate frequency when path reaches exactly length k
-        // This keeps the k-length subtraces
-        if path.len() == k {
-            let subtrace = Arc::from(&path[..]);
-            let entry = phi[start_idx]
-                .entry(subtrace)
-                .or_insert_with(|| Fraction::from((0, 1)));
-            *entry += f_q;
-            return;                        // stop DFS when path reaches k
+        let mut result: SuffixMap = HashMap::default();
+
+        if remaining == 0 {
+            // No more symbols allowed -> empty suffix with probability 1
+            result.insert(Arc::<[u32]>::from(Vec::<u32>::new()), Fraction::from((1, 1)));
+        } else {
+            for tr in &snfa.states[state_idx].transitions {
+                let label = tr.label.clone();
+                let prob = tr.probability.clone();
+
+                if label == "-" {
+                    // End marker -> stop exploring beyond this symbol
+                    let id = key.process_activity(&label);
+                    let arc = Arc::from(vec![key.get_id_from_activity(id) as u32]);
+                    result
+                        .entry(arc)
+                        .and_modify(|v| *v += &prob)
+                        .or_insert(prob);
+                } else {
+                    // Recurse to target with one fewer remaining symbol
+                    let child_map = collect_suffixes(tr.target, remaining - 1, snfa, key, cache);
+                    for (suf, w) in child_map.as_ref() {
+                        let mut vec = Vec::with_capacity(1 + suf.len());
+                        let id = key.process_activity(&label);
+                        vec.push(key.get_id_from_activity(id) as u32);
+                        vec.extend_from_slice(&suf[..]);
+                        let arc = Arc::from(vec);
+                        let weight = &prob * w;
+                        result
+                            .entry(arc)
+                            .and_modify(|v| *v += &weight)
+                            .or_insert(weight);
+                    }
+                }
+            }
         }
 
-        // Recursively follow outgoing transitions until we reach length k
-        for tr in &snfa.states[cur_idx].transitions {
-            path.push(tr.label.clone());
-            let next_f_q = &tr.probability * f_q; // multiply path weight
-            dfs(start_idx, tr.target, snfa, phi, path, k, &next_f_q);
-            path.pop();
-        }
+        let arc_result = Arc::new(result);
+        cache.insert((state_idx, remaining), arc_result.clone());
+        arc_result
     }
 
-    // Start DFS from each state with initial weight 1
-    let one = Fraction::from((1, 1));
+    // Build phi for every potential start state
     for q in 0..n {
-        dfs(q, q, snfa, &mut phi, &mut Vec::new(), k, &one);
+        let suffixes_arc = collect_suffixes(q, k, snfa, key, &mut cache);
+        let suffixes = suffixes_arc.as_ref();
+
+        for (trace_arc, prob_suffix) in suffixes.iter() {
+            let trace_slice = trace_arc.as_ref();
+
+            // Valid subtraces follow exactly these conditions
+            let is_exact_k = trace_slice.len() == k;
+            let is_short_with_end = !trace_slice.is_empty()
+                && trace_slice.len() <= k
+                && trace_slice.last().unwrap() == &id_minus
+                && trace_slice.first().unwrap() == &id_plus;
+
+            if is_exact_k || is_short_with_end {
+                phi[q].insert(trace_arc.clone(), prob_suffix.clone());
+            }
+        }
     }
 
     phi
@@ -884,7 +926,7 @@ pub fn compute_abstraction_for_petri_net(
         }
     }
     let mut b = vec![Fraction::from((0, 1)); n];
-    b[snfa.initial] = Fraction::from((1, 1)); // e₊
+    b[snfa.initial] = Fraction::from((1, 1));
     let mut a_ref = a_sparse;
     let x = if n < 100{
         // small matrices -> simpler hash map solver avoids conversion overhead
@@ -893,15 +935,30 @@ pub fn compute_abstraction_for_petri_net(
         solve_sparse_linear_system_optimized(&mut a_ref, b)?
     };
 
-    // 4 Compute Phi for each state
-    let phi = compute_phi(&snfa, k);
+    // 4 Compute phi for each state
+    // Compute phi on ID space then translate back to Strings using the shared ActivityKey
+    let mut key = patched_net.get_activity_key().clone();
+    let phi_ids = compute_phi_ids(&snfa, k, &mut key);
+
+    let key_read = key.clone();
+    // helper to translate a trace of u32 IDs back to Strings
+    let translate = move |ids: &Arc<[u32]>| -> Arc<[String]> {
+        let mut vec: Vec<String> = Vec::with_capacity(ids.len());
+        for id in ids.iter() {
+            let act = key_read.get_activity_by_id(*id as usize);
+            vec.push(key_read.deprocess_activity(&act).to_string());
+        }
+        Arc::from(vec)
+    };
 
     // 5 Compute f_l^k
     let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::default();
-    for (q, map) in phi.iter().enumerate() {
-        for (gamma, phi_val) in map {
+    for (q, map) in phi_ids.iter().enumerate() {
+        for (gamma_ids, phi_val) in map {
+            let gamma = translate(gamma_ids);
             let contribution = &x[q] * phi_val;
-            f_l_k.entry(gamma.clone())
+            f_l_k
+                .entry(gamma)
                 .and_modify(|v| *v = &*v + &contribution)
                 .or_insert(contribution.clone());
         }
