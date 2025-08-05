@@ -38,13 +38,9 @@ use crate::{
 /// will return an `anyhow::Error`.
 #[derive(Clone, Copy, Debug)]
 pub enum DistanceMetric {
-    /// Asymmetric m^k-uEMSC distance.
     Uemsc,
-    /// Symmetric total-variation distance 1/2 Sum|p−m|.
     TotalVariation,
-    /// Square-root Jensen–Shannon distance.
     JensenShannon,
-    /// Hellinger distance.
     Hellinger,
 }
 
@@ -61,8 +57,8 @@ pub trait StochasticMarkovianAbstraction {
     /// Implemented metrics:
     /// * `DistanceMetric::Uemsc` – returns `1 – uEMSC distance`
     /// * `DistanceMetric::TotalVariation` – returns `1 – TV distance`
-    /// * `DistanceMetric::JensenShannon` – returns `1 – √JSD`
-    /// * `DistanceMetric::Hellinger` – returns `1 – Hellinger`
+    /// * `DistanceMetric::JensenShannon` – returns `1 – Square-root Jensen–Shannon distance`
+    /// * `DistanceMetric::Hellinger` – returns `1 – Hellinger distance`
     ///
     /// Any other variant (if added in the future) will yield an error until
     /// its computation is implemented.
@@ -83,9 +79,6 @@ pub struct MarkovianAbstraction {
     pub abstraction: HashMap<Arc<[String]>, Fraction>,
 }
 
-// Trait Implementation
-
-// Implementation for finite stochastic languages (logs)
 impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
     fn markovian_conformance(
         &self,
@@ -102,54 +95,25 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
         let abstraction1 = compute_abstraction_for_log(self, k)
             .context("Computing abstraction for first language (finite log)")?;
 
-        // Step 2: Before computing the abstraction for the second language we must
-        // make sure it uses the same activity labels for the same activities
+        // Step 2: Compute abstraction for the second language
         let mut shared_key = self.get_activity_key().clone();
         let mut language2 = language2;
-        let abstraction2 = if let Some(pn) = (&mut *language2 as &mut dyn Any)
-            .downcast_mut::<StochasticLabelledPetriNet>()
-        {
-            // If the Petri net is unbounded, fall back to random sampling.
-            if !pn.bounded()? {
-                log::warn!("Model is unbounded; falling back to random sampling. If a livelock is also present this may not terminate.");
-                // Sample a finite stochastic language of DEFAULT_SAMPLE_SIZE traces
-                let sampled: FiniteStochasticLanguage = pn
-                    .sample(DEFAULT_SAMPLE_SIZE)
-                    .context("Sampling unbounded Petri net")?;
-                let mut boxed_sample: FiniteStochasticLanguage = sampled;
-                boxed_sample.translate_using_activity_key(&mut shared_key);
-                compute_abstraction_for_log(&boxed_sample, k)
-                    .context("Computing abstraction for second language (sampled log)")?
-            } else {
-                pn.translate_using_activity_key(&mut shared_key);
-                compute_abstraction_for_petri_net(pn, k)
-                    .context("Computing abstraction for second language (Petri net)")?
-            }
-        } else if let Some(flog) = (&mut *language2 as &mut dyn Any)
-            .downcast_mut::<FiniteStochasticLanguage>()
-        {
-            flog.translate_using_activity_key(&mut shared_key);
-            compute_abstraction_for_log(flog, k)
-                .context("Computing abstraction for second language (finite log)")?
-        } else {
-            return Err(anyhow::anyhow!(
-                "markovian_conformance: unsupported type for second language"
-            ));
-        };
+        let abstraction2 = abstraction_of(language2.as_mut(), &mut shared_key, k)
+            .context("Computing abstraction for second language")?;
 
         // Step 3: Compute the conformance between the abstractions depending on the metric
         match metric {
             DistanceMetric::Uemsc => {
-                let d = compute_uemsc_conformance(&abstraction1, &abstraction2)?;
-                // already returns the conformance score not the distance
-                Ok(d)
+                let uemsc = compute_uemsc_distance(&abstraction1, &abstraction2)?;
+                let one = Fraction::from((1, 1));
+                Ok(&one - &uemsc)
             }
             DistanceMetric::TotalVariation => {
                 let tv = compute_total_variation_distance(&abstraction1, &abstraction2)?;
                 let one = Fraction::from((1, 1));
                 Ok(&one - &tv)
             }
-                    DistanceMetric::JensenShannon => {
+            DistanceMetric::JensenShannon => {
                 let js = compute_jensen_shannon_distance(&abstraction1, &abstraction2)?;
                 let one = Fraction::from((1, 1));
                 Ok(&one - &js)
@@ -162,6 +126,62 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
 
         }
     }
+}
+
+/// Constructs the k-th order Markovian abstraction for an arbitrary
+/// EbiTraitQueriableStochasticLanguage. Currently supports
+/// StochasticLabelledPetriNet (bounded / unbounded) and
+/// FiniteStochasticLanguage. It can be extended later for further models
+/// by adding additional downcast_mut branches in one place.
+fn abstraction_of(
+    lang: &mut dyn EbiTraitQueriableStochasticLanguage,
+    activity_key: &mut ActivityKey,
+    k: usize,
+) -> Result<MarkovianAbstraction> {
+    // Case 1: Stochastic labelled Petri net
+    if let Some(pn) = (lang as &mut dyn Any).downcast_mut::<StochasticLabelledPetriNet>() {
+        if !pn.bounded()? {
+            log::warn!("Model is unbounded; falling back to random sampling. If a livelock is also present this may not terminate.");
+            let sampled: FiniteStochasticLanguage = pn
+                .sample(DEFAULT_SAMPLE_SIZE)
+                .context("Sampling unbounded Petri net")?;
+            let mut sampled = sampled;
+            sampled.translate_using_activity_key(activity_key);
+            compute_abstraction_for_log(&sampled, k)
+        } else {
+            pn.translate_using_activity_key(activity_key);
+            compute_abstraction_for_petri_net(pn, k)
+        }
+    // Case 2: Finite stochastic language (log)
+    } else if let Some(flog) = (lang as &mut dyn Any).downcast_mut::<FiniteStochasticLanguage>() {
+        flog.translate_using_activity_key(activity_key);
+        compute_abstraction_for_log(flog, k)
+    } else {
+        Err(anyhow::anyhow!("Unsupported type for stochastic Markovian abstraction"))
+    }
+}
+
+/// Compute the uEMSC distance between two abstractions.
+fn compute_uemsc_distance(
+    abstraction1: &MarkovianAbstraction,
+    abstraction2: &MarkovianAbstraction,
+) -> Result<Fraction> {
+    let mut positive_diff = Fraction::from((0, 1));
+    let zero = Fraction::from((0, 1));
+
+    for (gamma, p1) in &abstraction1.abstraction {
+        let p2 = abstraction2
+            .abstraction
+            .get(gamma)
+            .unwrap_or(&zero);
+
+        if p1 > p2 {
+            let diff = &*p1 - &*p2;
+            positive_diff += diff;
+        }
+    }
+
+    Ok(positive_diff)
 }
 
 /// Compute the Jensen–Shannon distance between two abstractions.
@@ -242,8 +262,6 @@ fn compute_jensen_shannon_distance(
     let num = (d * DEN as f64).round() as u64;
     Ok(Fraction::from((num, DEN)))
 }
-
-
 
 /// Compute the Hellinger distance between two abstractions.
 fn compute_hellinger_distance(
@@ -365,6 +383,98 @@ pub fn compute_abstraction_for_log(
         let count_ref: &Fraction = &count;
         let total_ref: &Fraction = &total;
         abstraction.insert(subtrace, count_ref / total_ref);
+    }
+
+    Ok(MarkovianAbstraction { k, abstraction })
+}
+
+/// Compute the k-th order Markovian abstraction for a Petri net.
+pub fn compute_abstraction_for_petri_net(
+    petri_net: &StochasticLabelledPetriNet,
+    k: usize,
+) -> Result<MarkovianAbstraction> {
+    if k < 1 {
+        return Err(anyhow::anyhow!("k must be at least 1 for Markovian abstraction"));
+    }
+
+    // 0.5 Patch bounded livelocks by adding timeout escapes (delta = 1e-4) (maybe make optional parameter later)
+    let patched_net = livelock_patch::patch_livelocks(petri_net, Fraction::from((1, 10000)))?;
+
+    // 1 Build embedded SNFA
+    let mut snfa_raw = build_embedded_snfa(&patched_net)?;
+
+    // 1.1 Remove tau transitions
+    snfa_raw.remove_tau_transitions();
+
+    // 2 Patch it
+    let snfa = patch_snfa(&snfa_raw);
+
+    // 3 Build matrix and solve for x
+    let n = snfa.states.len();
+    // Build sparse A = (I - Delta)^T
+    let delta = build_delta(&snfa);
+    let mut a_sparse: Vec<HashMap<usize, Fraction>> = vec![HashMap::default(); n];
+
+    for i in 0..n {
+        // Identity contribution
+        a_sparse[i].insert(i, Fraction::from((1, 1)));
+
+        // Subtract row i of Delta into column i of A
+        for (&j, p) in &delta[i] {
+            // A[j,i] = I[j,i] - Delta[i,j]
+            a_sparse[j]
+                .entry(i)
+                .and_modify(|v| *v -= p)
+                .or_insert_with(|| -p.clone());
+        }
+    }
+    let mut b = vec![Fraction::from((0, 1)); n];
+    b[snfa.initial] = Fraction::from((1, 1));
+    let mut a_ref = a_sparse;
+    let x = if n < 100{
+        // small matrices -> simpler hash map solver avoids conversion overhead
+        solve_sparse_linear_system(&mut a_ref, b)?
+    } else {
+        solve_sparse_linear_system_optimized(&mut a_ref, b)?
+    };
+
+    // 4 Compute phi for each state
+    // Compute phi on ID space then translate back to Strings using the shared ActivityKey
+    let mut key = patched_net.get_activity_key().clone();
+    let phi_ids = compute_phi_ids(&snfa, k, &mut key);
+
+    let key_read = key.clone();
+    // helper to translate a trace of u32 IDs back to Strings
+    let translate = move |ids: &Arc<[u32]>| -> Arc<[String]> {
+        let mut vec: Vec<String> = Vec::with_capacity(ids.len());
+        for id in ids.iter() {
+            let act = key_read.get_activity_by_id(*id as usize);
+            vec.push(key_read.deprocess_activity(&act).to_string());
+        }
+        Arc::from(vec)
+    };
+
+    // 5 Compute f_l^k
+    let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::default();
+    for (q, map) in phi_ids.iter().enumerate() {
+        for (gamma_ids, phi_val) in map {
+            let gamma = translate(gamma_ids);
+            let contribution = &x[q] * phi_val;
+            f_l_k
+                .entry(gamma)
+                .and_modify(|v| *v = &*v + &contribution)
+                .or_insert(contribution.clone());
+        }
+    }
+
+    // 6 Normalize
+    let mut total = Fraction::from((0, 1));
+    for v in f_l_k.values() {
+        total += v;
+    }
+    let mut abstraction = HashMap::default();
+    for (gamma, val) in f_l_k {
+        abstraction.insert(gamma, &val / &total);
     }
 
     Ok(MarkovianAbstraction { k, abstraction })
@@ -520,7 +630,7 @@ fn build_embedded_snfa(net: &StochasticLabelledPetriNet) -> Result<Snfa> {
     Ok(snfa)
 }
 
-// Patching - assumes SNFA is already tau-free
+// Patch the SNFA by adding + and - transitions
 fn patch_snfa(snfa: &Snfa) -> Snfa {
     // Create a new vector of states to avoid borrow conflicts
     let mut states = snfa.states.clone();
@@ -528,7 +638,7 @@ fn patch_snfa(snfa: &Snfa) -> Snfa {
     let q_plus = states.len();
     let q_minus = states.len() + 1;
 
-    // Redirect original finals to q₋ via '-'
+    // Redirect original finals to q_minus via '-'
     for i in 0..states.len() {
         let s = &mut states[i];
         if !s.p_final.is_zero() {
@@ -545,7 +655,7 @@ fn patch_snfa(snfa: &Snfa) -> Snfa {
         }
     }
 
-    // q₊ with +-transition to original initial state
+    // q_plus with + transition to original initial state
     states.push(SnfaState { 
         transitions: vec![SnfaTransition { 
             target: snfa.initial, 
@@ -555,7 +665,7 @@ fn patch_snfa(snfa: &Snfa) -> Snfa {
         p_final: Fraction::from((0, 1))
     });
 
-    // q₋ absorbing final state
+    // q_minus absorbing final state
     states.push(SnfaState { 
         transitions: vec![], 
         p_final: Fraction::from((1, 1))
@@ -884,135 +994,6 @@ fn compute_phi_ids(snfa: &Snfa, k: usize, key: &mut ActivityKey) -> Vec<HashMap<
     phi
 }
 
-
-// Main Petri-net abstraction function
-pub fn compute_abstraction_for_petri_net(
-    petri_net: &StochasticLabelledPetriNet,
-    k: usize,
-) -> Result<MarkovianAbstraction> {
-    if k < 1 {
-        return Err(anyhow::anyhow!("k must be at least 1 for Markovian abstraction"));
-    }
-
-    // 0.5 Patch bounded livelocks by adding timeout escapes (δ = 1e-4) (maybe make optional parameter later)
-    let patched_net = livelock_patch::patch_livelocks(petri_net, Fraction::from((1, 10000)))?;
-
-    // 1 Build embedded SNFA
-    let mut snfa_raw = build_embedded_snfa(&patched_net)?;
-
-    // 1.1 Remove tau transitions
-    snfa_raw.remove_tau_transitions();
-
-    // 2 Patch it
-    let snfa = patch_snfa(&snfa_raw);
-
-    // 3 Build matrix and solve for x
-    let n = snfa.states.len();
-    // Build sparse A = (I − Delta)^T
-    let delta = build_delta(&snfa);
-    let mut a_sparse: Vec<HashMap<usize, Fraction>> = vec![HashMap::default(); n];
-
-    for i in 0..n {
-        // Identity contribution
-        a_sparse[i].insert(i, Fraction::from((1, 1)));
-
-        // Subtract row i of Delta into column i of A
-        for (&j, p) in &delta[i] {
-            // A[j,i] = I[j,i] − Delta[i,j]
-            a_sparse[j]
-                .entry(i)
-                .and_modify(|v| *v -= p)
-                .or_insert_with(|| -p.clone());
-        }
-    }
-    let mut b = vec![Fraction::from((0, 1)); n];
-    b[snfa.initial] = Fraction::from((1, 1));
-    let mut a_ref = a_sparse;
-    let x = if n < 100{
-        // small matrices -> simpler hash map solver avoids conversion overhead
-        solve_sparse_linear_system(&mut a_ref, b)?
-    } else {
-        solve_sparse_linear_system_optimized(&mut a_ref, b)?
-    };
-
-    // 4 Compute phi for each state
-    // Compute phi on ID space then translate back to Strings using the shared ActivityKey
-    let mut key = patched_net.get_activity_key().clone();
-    let phi_ids = compute_phi_ids(&snfa, k, &mut key);
-
-    let key_read = key.clone();
-    // helper to translate a trace of u32 IDs back to Strings
-    let translate = move |ids: &Arc<[u32]>| -> Arc<[String]> {
-        let mut vec: Vec<String> = Vec::with_capacity(ids.len());
-        for id in ids.iter() {
-            let act = key_read.get_activity_by_id(*id as usize);
-            vec.push(key_read.deprocess_activity(&act).to_string());
-        }
-        Arc::from(vec)
-    };
-
-    // 5 Compute f_l^k
-    let mut f_l_k: HashMap<Arc<[String]>, Fraction> = HashMap::default();
-    for (q, map) in phi_ids.iter().enumerate() {
-        for (gamma_ids, phi_val) in map {
-            let gamma = translate(gamma_ids);
-            let contribution = &x[q] * phi_val;
-            f_l_k
-                .entry(gamma)
-                .and_modify(|v| *v = &*v + &contribution)
-                .or_insert(contribution.clone());
-        }
-    }
-
-    // 6 Normalize
-    let mut total = Fraction::from((0, 1));
-    for v in f_l_k.values() {
-        total += v;
-    }
-    let mut abstraction = HashMap::default();
-    for (gamma, val) in f_l_k {
-        abstraction.insert(gamma, &val / &total);
-    }
-
-    Ok(MarkovianAbstraction { k, abstraction })
-}
-
-/// Compute the m^k-uEMSC conformance between two Markovian abstractions
-pub fn compute_uemsc_conformance(
-    abstraction1: &MarkovianAbstraction,
-    abstraction2: &MarkovianAbstraction,
-) -> Result<Fraction> {
-    // Sanity-check: abstractions must be of the same order k
-    if abstraction1.k != abstraction2.k {
-        return Err(anyhow::anyhow!(
-            "Cannot compare abstractions of different order: k1={}, k2={}",
-            abstraction1.k, abstraction2.k
-        ));
-    }
-
-    // Sum for Σ_γ max(m1(γ) − m2(γ), 0)
-    let mut positive_diff = Fraction::from((0, 1));
-    let zero = Fraction::from((0, 1));
-
-    for (gamma, p1) in &abstraction1.abstraction {
-        let p2 = abstraction2
-            .abstraction
-            .get(gamma)
-            .unwrap_or(&zero);
-
-        if p1 > p2 {
-            let diff = &*p1 - &*p2;
-            positive_diff += diff;
-        }
-    }
-
-    // Conformance = 1 - positive_diff
-    let one = Fraction::from((1, 1));
-    let conformance = &one - &positive_diff;
-
-    Ok(conformance)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1029,7 +1010,7 @@ mod tests {
         let event_log = file_content.parse::<EventLog>().unwrap();
         let finite_lang: FiniteStochasticLanguage = Into::into(event_log);
         
-        // Compute abstraction with k=2 for example log [⟨a,b⟩^{5}, ⟨a,a,b,c⟩^{2}, ⟨a,a,c,b⟩^{1}]
+        // Compute abstraction with k=2 for example log [<a,b>^{5}, <a,a,b,c>^{2}, <a,a,c,b>^{1}]
         let abstraction = compute_abstraction_for_log(&finite_lang, 2).unwrap();
         
         println!("\nComputed abstraction for example log with k=2:");
@@ -1103,12 +1084,12 @@ mod tests {
             let key: Vec<String> = trace_str.split_whitespace().map(|s| s.to_string()).collect();
             let arc_key = Arc::from(key.as_slice());
             if let Some(prob) = abstraction.abstraction.get(&arc_key) {
-                println!("Found ⟨{}⟩ with probability {}", trace_str, prob);
+                println!("Found <{}> with probability {}", trace_str, prob);
                 assert_eq!(prob.to_string(), *expected_prob,
-                    "Probability mismatch for trace ⟨{}⟩: expected {}, got {}",
+                    "Probability mismatch for trace <{}>: expected {}, got {}",
                     trace_str, expected_prob, prob);
             } else {
-                panic!("Expected trace ⟨{}⟩ not found in abstraction", trace_str);
+                panic!("Expected trace <{}> not found in abstraction", trace_str);
             }
         }
 
@@ -1130,11 +1111,11 @@ mod tests {
         petri_net.translate_using_activity_key(finite_lang.get_activity_key_mut());
 
         // Compute the m^2-uEMSC distance (k = 2)
-        let distance = (&finite_lang as &dyn EbiTraitFiniteStochasticLanguage)
+        let conformance = (&finite_lang as &dyn EbiTraitFiniteStochasticLanguage)
             .markovian_conformance(Box::new(petri_net), 2, DistanceMetric::Uemsc)
             .unwrap();
 
-        println!("Computed m^2-uEMSC distance: {}", distance);
-        assert_eq!(distance, Fraction::from((4, 5))); // Expect 4/5
+        println!("Computed m^2-uEMSC conformance: {}", conformance);
+        assert_eq!(conformance, Fraction::from((4, 5))); // Expect 4/5
     }
 }
