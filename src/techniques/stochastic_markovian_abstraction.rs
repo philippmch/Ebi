@@ -27,7 +27,7 @@ use crate::{
     },
 
     math::fraction::{Fraction, MaybeExact},
-    math::traits::{Zero, Signed},
+    math::traits::Zero,
     techniques::bounded::Bounded,
     techniques::livelock_patch,
     techniques::sample::Sampler,
@@ -39,7 +39,7 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub enum DistanceMetric {
     Uemsc,
-    TotalVariation,
+    ScaledL2,
     JensenShannon,
     Hellinger,
 }
@@ -56,7 +56,7 @@ pub trait StochasticMarkovianAbstraction {
     ///
     /// Implemented metrics:
     /// * `DistanceMetric::Uemsc` – returns `1 – uEMSC distance`
-    /// * `DistanceMetric::TotalVariation` – returns `1 – TV distance`
+    /// * `DistanceMetric::ScaledL2` – returns `1 – Scaled L2 distance`
     /// * `DistanceMetric::JensenShannon` – returns `1 – Square-root Jensen–Shannon distance`
     /// * `DistanceMetric::Hellinger` – returns `1 – Hellinger distance`
     ///
@@ -108,10 +108,10 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
                 let one = Fraction::from((1, 1));
                 Ok(&one - &uemsc)
             }
-            DistanceMetric::TotalVariation => {
-                let tv = compute_total_variation_distance(&abstraction1, &abstraction2)?;
+            DistanceMetric::ScaledL2 => {
+                let l2 = compute_scaled_l2_distance(&abstraction1, &abstraction2)?;
                 let one = Fraction::from((1, 1));
-                Ok(&one - &tv)
+                Ok(&one - &l2)
             }
             DistanceMetric::JensenShannon => {
                 let js = compute_jensen_shannon_distance(&abstraction1, &abstraction2)?;
@@ -290,38 +290,32 @@ fn compute_hellinger_distance(
     Ok(h_sq.sqrt_abs(15))
 }
 
-
-/// Compute the symmetric total-variation distance between two abstractions.
-fn compute_total_variation_distance(
+/// Compute the scaled L2 distance between two abstractions.
+fn compute_scaled_l2_distance(
     abstraction1: &MarkovianAbstraction,
     abstraction2: &MarkovianAbstraction,
 ) -> Result<Fraction> {
-    if abstraction1.k != abstraction2.k {
-        return Err(anyhow::anyhow!(
-            "Cannot compare abstractions of different order: k1={}, k2={}",
-            abstraction1.k, abstraction2.k
-        ));
-    }
-
-    let mut diff_sum = Fraction::from((0, 1));
+    let mut sum_squared = Fraction::from((0, 1));
     let zero = Fraction::from((0, 1));
-
+    
     // Iterate over union of keys; first pass abstraction1
     for (gamma, p1) in &abstraction1.abstraction {
         let p2 = abstraction2.abstraction.get(gamma).unwrap_or(&zero);
-        let d = (p1 - p2).abs();
-        diff_sum += d;
+        let diff = p1 - p2;
+        sum_squared += &diff * &diff;
     }
-    // Now add keys that are only in abstraction2
+    
+    // Add keys only in abstraction2
     for (gamma, p2) in &abstraction2.abstraction {
         if !abstraction1.abstraction.contains_key(gamma) {
-            diff_sum += p2.clone();
+            sum_squared += p2 * p2;
         }
     }
-
-    // Multiply by 1/2
-    diff_sum /= 2usize;
-    Ok(diff_sum)
+    
+    // Take square root and divide by sqrt(2) to get range [0,1]
+    let l2_norm = sum_squared.sqrt_abs(15);
+    let sqrt_2 = Fraction::from((2, 1)).sqrt_abs(15);
+    Ok(&l2_norm / &sqrt_2)
 }
 
 /// This implements the calculation of the k-th order Stochastic Markovian abstraction

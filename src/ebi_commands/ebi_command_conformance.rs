@@ -321,7 +321,7 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
         use crate::techniques::stochastic_markovian_abstraction::DistanceMetric;
         let metric = match metric_str.to_ascii_lowercase().as_str() {
             "uemsc" => DistanceMetric::Uemsc,
-            "tv" | "totalvariation" | "total_variation" => DistanceMetric::TotalVariation,
+            "l2" | "scaled_l2" => DistanceMetric::ScaledL2,
             "js" | "jsd" | "jensen" | "jensen-shannon" => DistanceMetric::JensenShannon,
             "hellinger" | "h" => DistanceMetric::Hellinger,
             other => return Err(anyhow!(format!("Unknown metric '{}'.", other))),
