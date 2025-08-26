@@ -68,6 +68,7 @@ pub mod ebi_objects {
     pub mod scalable_vector_graphics;
     pub mod stochastic_deterministic_finite_automaton;
     pub mod stochastic_deterministic_finite_automaton_semantics;
+    pub mod stochastic_nondeterministic_finite_automaton;
     pub mod stochastic_directly_follows_graph_semantics;
     pub mod stochastic_directly_follows_model;
     pub mod stochastic_labelled_petri_net;
@@ -181,6 +182,8 @@ pub mod techniques {
     pub mod trace_probability;
     pub mod uniform_stochastic_miner;
     pub mod unit_earth_movers_stochastic_conformance;
+    pub mod livelock_patch;
+    pub mod stochastic_markovian_abstraction;
 }
 pub mod follower_semantics;
 pub mod json;
