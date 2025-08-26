@@ -42,7 +42,9 @@ pub const CONFORMANCE_UEMSC: EbiCommand = EbiCommand::Command {
     name_short: "uemsc",
     name_long: Some("unit-earth-movers-stochastic-conformance"),
     explanation_short: "Compute unit-earth movers' stochastic conformance.",
-    explanation_long: Some("Compute unit-earth movers' stochastic conformance, also known as total variation distance."),
+    explanation_long: Some(
+        "Compute unit-earth movers' stochastic conformance, also known as total variation distance.",
+    ),
     latex_link: Some("\\cite{DBLP:conf/bpm/LeemansSA19}"),
     cli_command: None,
     exact_arithmetic: true,
@@ -168,7 +170,7 @@ pub const CONFORMANCE_JSSC_SAMPLE: EbiCommand = EbiCommand::Command {
     input_types: &[
         SAMPLED_OBJECT_INPUTS,
         SAMPLED_OBJECT_INPUTS,
-        &[&EbiInputType::Usize],
+        &[&EbiInputType::Usize(Some(1), None, None)],
     ],
     input_names: &["FILE_1", "FILE_2", "NUMBER_OF_TRACES"],
     input_helps: &[
@@ -204,7 +206,9 @@ pub const CONFORMANCE_EMSC: EbiCommand = EbiCommand::Command {
     name_short: "emsc",
     name_long: Some("earth-movers-stochastic-conformance"),
     explanation_short: "Compute Earth mover's stochastic conformance.",
-    explanation_long: Some("Compute Earth mover's stochastic conformance, also known as the Wasserstein distance."),
+    explanation_long: Some(
+        "Compute Earth mover's stochastic conformance, also known as the Wasserstein distance.",
+    ),
     latex_link: Some("\\cite{DBLP:journals/is/LeemansABP21}"),
     cli_command: None,
     exact_arithmetic: true,
@@ -240,14 +244,16 @@ pub const CONFORMANCE_EMSC_SAMPLE: EbiCommand = EbiCommand::Command {
     name_short: "emsc-sample",
     name_long: Some("earth-movers-stochastic-conformance-sample"),
     explanation_short: "Compute Earth mover's stochastic conformance with sampling.",
-    explanation_long: Some("Compute Earth mover's stochastic conformance with sampling, also known as the Wasserstein distance."),
+    explanation_long: Some(
+        "Compute Earth mover's stochastic conformance with sampling, also known as the Wasserstein distance.",
+    ),
     latex_link: Some("\\cite{DBLP:journals/is/LeemansABP21}"),
     cli_command: None,
     exact_arithmetic: true,
     input_types: &[
         &[&EbiInputType::Trait(EbiTrait::FiniteStochasticLanguage)],
         SAMPLED_OBJECT_INPUTS,
-        &[&EbiInputType::Usize],
+        &[&EbiInputType::Usize(Some(1), None, None)],
     ],
     input_names: &["FILE_1", "FILE_2", "NUMBER_OF_TRACES"],
     input_helps: &[

@@ -6,6 +6,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use ebi_arithmetic::{
+    ebi_number::{Signed, Zero},
+    fraction::Fraction,
+};
+use ebi_derive::ActivityKey;
 use layout::topo::layout::VisualGraph;
 use serde_json::Value;
 
@@ -17,25 +22,22 @@ use crate::{
         ebi_file_handler::EbiFileHandler,
         ebi_input::{self, EbiInput, EbiObjectImporter, EbiTraitImporter},
         ebi_object::EbiObject,
-        ebi_output::EbiOutput,
+        ebi_output::{EbiObjectExporter, EbiOutput},
         ebi_trait::FromEbiTraitObject,
         exportable::Exportable,
         importable::Importable,
         infoable::Infoable,
     },
     ebi_traits::{
-        ebi_trait_graphable::EbiTraitGraphable,
+        ebi_trait_activities,
+        ebi_trait_graphable::{self, EbiTraitGraphable},
         ebi_trait_semantics::{EbiTraitSemantics, ToSemantics},
         ebi_trait_stochastic_deterministic_semantics::{
             EbiTraitStochasticDeterministicSemantics, ToStochasticDeterministicSemantics,
         },
         ebi_trait_stochastic_semantics::{EbiTraitStochasticSemantics, ToStochasticSemantics},
     },
-    json,
-    math::{
-        fraction::Fraction,
-        traits::{Signed, Zero},
-    },
+    format_comparison, json,
 };
 
 use super::{
@@ -43,21 +45,29 @@ use super::{
     stochastic_directly_follows_model::StochasticDirectlyFollowsModel,
 };
 
-pub const FORMAT_SPECIFICATION: &str = "A directly follows graph is a JSON structure.";
+pub const FORMAT_SPECIFICATION: &str = concat!(
+    "A directly follows graph is a JSON structure.
+    
+    For instance:
+    \\lstinputlisting[language=ebilines, style=boxed]{../testfiles/aa-ab-ba.dfg}",
+    format_comparison!()
+);
 
 pub const EBI_DIRECTLY_FOLLOWS_GRAPH: EbiFileHandler = EbiFileHandler {
     name: "directly follows graph",
     article: "a",
     file_extension: "dfg",
+    is_binary: false,
     format_specification: &FORMAT_SPECIFICATION,
     validator: Some(ebi_input::validate::<DirectlyFollowsGraph>),
     trait_importers: &[
+        EbiTraitImporter::Activities(ebi_trait_activities::import::<DirectlyFollowsGraph>),
         EbiTraitImporter::Semantics(DirectlyFollowsGraph::import_as_semantics),
         EbiTraitImporter::StochasticSemantics(DirectlyFollowsGraph::import_as_stochastic_semantics),
         EbiTraitImporter::StochasticDeterministicSemantics(
             DirectlyFollowsGraph::import_as_stochastic_deterministic_semantics,
         ),
-        EbiTraitImporter::Graphable(DirectlyFollowsGraph::import_as_graphable),
+        EbiTraitImporter::Graphable(ebi_trait_graphable::import::<DirectlyFollowsGraph>),
     ],
     object_importers: &[
         EbiObjectImporter::DirectlyFollowsGraph(DirectlyFollowsGraph::import_as_object),
@@ -72,7 +82,9 @@ pub const EBI_DIRECTLY_FOLLOWS_GRAPH: EbiFileHandler = EbiFileHandler {
             DirectlyFollowsGraph::import_as_stochastic_labelled_petri_net,
         ),
     ],
-    object_exporters: &[],
+    object_exporters: &[EbiObjectExporter::DirectlyFollowsGraph(
+        DirectlyFollowsGraph::export_from_object,
+    )],
     java_object_handlers: &[], //java translations covered by LabelledPetrinet
 };
 
@@ -120,11 +132,6 @@ impl DirectlyFollowsGraph {
     pub fn import_as_stochastic_labelled_petri_net(reader: &mut dyn BufRead) -> Result<EbiObject> {
         let dfg = Self::import(reader)?;
         Ok(EbiObject::StochasticLabelledPetriNet(dfg.into()))
-    }
-
-    pub fn import_as_graphable(reader: &mut dyn BufRead) -> Result<Box<dyn EbiTraitGraphable>> {
-        let dfg = Self::import(reader)?;
-        Ok(Box::new(dfg))
     }
 
     pub fn get_max_state(&self) -> usize {
@@ -506,7 +513,11 @@ impl Infoable for DirectlyFollowsGraph {
             "Number of activities\t\t{}",
             self.activity_key.activity2name.len()
         )?;
-        writeln!(f, "Number of start activities\t{}", self.start_activities.len())?;
+        writeln!(
+            f,
+            "Number of start activities\t{}",
+            self.start_activities.len()
+        )?;
         writeln!(f, "Number of end activities\t{}", self.end_activities.len())?;
 
         let mut sum: Fraction = self.weights.iter().sum();

@@ -1,4 +1,5 @@
 use anyhow::{Context, anyhow};
+use ebi_arithmetic::fraction::Fraction;
 
 use crate::{
     ebi_framework::{
@@ -9,10 +10,8 @@ use crate::{
         ebi_trait::EbiTrait,
     },
     ebi_objects::{labelled_petri_net::LabelledPetriNet, process_tree::ProcessTree},
-    ebi_traits::
-        ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage
-    ,
-    math::fraction::Fraction,
+    ebi_traits::ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage,
+    math::constant_fraction::ConstFraction,
     techniques::{
         alignment_stochastic_miner::AlignmentMiner,
         directly_follows_model_miner::DirectlyFollowsModelMinerFiltering,
@@ -39,8 +38,10 @@ pub const EBI_DISCOVER: EbiCommand = EbiCommand::Group {
 pub const EBI_DISCOVER_ALIGNMENTS: EbiCommand = EbiCommand::Command {
     name_short: "ali",
     name_long: Some("alignments"),
-    explanation_short: "Give each transition a weight that matches the aligned occurrences of its label. The model must be livelock-free.",
-    explanation_long: None,
+    explanation_short: "Give each transition a weight that matches the aligned occurrences of its label.",
+    explanation_long: Some(
+        "Give each transition a weight that matches the aligned occurrences of its label. The model must be livelock-free.",
+    ),
     latex_link: Some("~\\cite{DBLP:conf/icpm/BurkeLW20}"),
     cli_command: None,
     exact_arithmetic: true,
@@ -78,7 +79,11 @@ pub const EBI_DISCOVER_DIRECTLY_FOLLOWS: EbiCommand = EbiCommand::Command {
             &EbiInputType::Trait(EbiTrait::EventLog),
             &EbiInputType::Trait(EbiTrait::FiniteStochasticLanguage),
         ],
-        &[&EbiInputType::Fraction],
+        &[&EbiInputType::Fraction(
+            Some(ConstFraction::zero()),
+            Some(ConstFraction::one()),
+            Some(ConstFraction::one()),
+        )],
     ],
     input_names: &["LANG", "MIN_FITNESS"],
     input_helps: &[
