@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
+use ebi_arithmetic::fraction::Fraction;
+use ebi_arithmetic::ebi_number::Signed;
 
 use crate::{
     ebi_objects::{
@@ -10,10 +12,6 @@ use crate::{
     ebi_traits::{
         ebi_trait_semantics::Semantics,
         ebi_trait_stochastic_semantics::StochasticSemantics,
-    },
-    math::{
-        fraction::Fraction,
-        traits::Signed,
     },
 };
 

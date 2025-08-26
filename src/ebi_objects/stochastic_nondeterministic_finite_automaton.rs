@@ -1,5 +1,5 @@
-use crate::math::fraction::Fraction;
-use crate::math::traits::Zero;
+use ebi_arithmetic::fraction::Fraction;
+use ebi_arithmetic::ebi_number::Zero;
 use std::collections::{HashMap, VecDeque};
 /// A transition in a stochastic non-deterministic finite automaton
 #[derive(Clone, Debug)]

@@ -5,11 +5,19 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ebi_arithmetic::fraction::Fraction;
+use ebi_arithmetic::exact::MaybeExact;
+use ebi_arithmetic::ebi_number::Zero;
 
 use num_traits::ToPrimitive;
 
 use crate::{
-    ebi_traits::{ebi_trait_semantics::Semantics, ebi_trait_stochastic_semantics::StochasticSemantics},
+    ebi_traits::{
+        ebi_trait_semantics::Semantics, 
+        ebi_trait_stochastic_semantics::StochasticSemantics,
+        ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage,
+        ebi_trait_queriable_stochastic_language::EbiTraitQueriableStochasticLanguage,
+    },
     ebi_framework::activity_key::TranslateActivityKey,
     ebi_framework::activity_key::ActivityKey,
     ebi_framework::activity_key::HasActivityKey,
@@ -21,13 +29,6 @@ use crate::{
         State as SnfaState,
         Transition as SnfaTransition,
     },
-    ebi_traits::{
-        ebi_trait_finite_stochastic_language::EbiTraitFiniteStochasticLanguage,
-        ebi_trait_queriable_stochastic_language::EbiTraitQueriableStochasticLanguage,
-    },
-
-    math::fraction::{Fraction, MaybeExact},
-    math::traits::Zero,
     techniques::bounded::Bounded,
     techniques::livelock_patch,
     techniques::sample::Sampler,
@@ -67,6 +68,7 @@ pub trait StochasticMarkovianAbstraction {
         language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
         k: usize,
         metric: DistanceMetric,
+        delta: Fraction,
     ) -> Result<Fraction>;
 }
 
@@ -85,6 +87,7 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
         language2: Box<dyn EbiTraitQueriableStochasticLanguage>,
         k: usize,
         metric: DistanceMetric,
+        delta: Fraction,
     ) -> Result<Fraction> {
         // Validate k
         if k < 1 {
@@ -98,7 +101,7 @@ impl StochasticMarkovianAbstraction for dyn EbiTraitFiniteStochasticLanguage {
         // Step 2: Compute abstraction for the second language
         let mut shared_key = self.get_activity_key().clone();
         let mut language2 = language2;
-        let abstraction2 = abstraction_of(language2.as_mut(), &mut shared_key, k)
+        let abstraction2 = abstraction_of(language2.as_mut(), &mut shared_key, k, delta)
             .context("Computing abstraction for second language")?;
 
         // Step 3: Compute the conformance between the abstractions depending on the metric
@@ -137,6 +140,7 @@ fn abstraction_of(
     lang: &mut dyn EbiTraitQueriableStochasticLanguage,
     activity_key: &mut ActivityKey,
     k: usize,
+    delta: Fraction,
 ) -> Result<MarkovianAbstraction> {
     // Case 1: Stochastic labelled Petri net
     if let Some(pn) = (lang as &mut dyn Any).downcast_mut::<StochasticLabelledPetriNet>() {
@@ -150,7 +154,7 @@ fn abstraction_of(
             compute_abstraction_for_log(&sampled, k)
         } else {
             pn.translate_using_activity_key(activity_key);
-            compute_abstraction_for_petri_net(pn, k)
+            compute_abstraction_for_petri_net(pn, k, delta)
         }
     // Case 2: Finite stochastic language (log)
     } else if let Some(flog) = (lang as &mut dyn Any).downcast_mut::<FiniteStochasticLanguage>() {
@@ -386,13 +390,14 @@ pub fn compute_abstraction_for_log(
 pub fn compute_abstraction_for_petri_net(
     petri_net: &StochasticLabelledPetriNet,
     k: usize,
+    delta: Fraction,
 ) -> Result<MarkovianAbstraction> {
     if k < 1 {
         return Err(anyhow::anyhow!("k must be at least 1 for Markovian abstraction"));
     }
 
-    // 0.5 Patch bounded livelocks by adding timeout escapes (delta = 1e-4) (maybe make optional parameter later)
-    let patched_net = livelock_patch::patch_livelocks(petri_net, Fraction::from((1, 10000)))?;
+    // 0.5 Patch bounded livelocks by adding timeout escapes
+    let patched_net = livelock_patch::patch_livelocks(petri_net, delta)?;
 
     // 1 Build embedded SNFA
     let mut snfa_raw = build_embedded_snfa(&patched_net)?;
@@ -1050,11 +1055,11 @@ mod tests {
         let petri_net = file_content.parse::<StochasticLabelledPetriNet>().unwrap();
         
         // Check that k < 1 is rejected (k = 0)
-        let result = compute_abstraction_for_petri_net(&petri_net, 0);
+        let result = compute_abstraction_for_petri_net(&petri_net, 0, Fraction::from((1, 1000)));
         assert!(result.is_err(), "Should reject k < 1");
         
         // Compute abstraction with k=2
-        let abstraction = compute_abstraction_for_petri_net(&petri_net, 2).unwrap();
+        let abstraction = compute_abstraction_for_petri_net(&petri_net, 2, Fraction::from((1, 1000))).unwrap();
         
 
         // Check that probabilities sum to 1
@@ -1106,7 +1111,7 @@ mod tests {
 
         // Compute the m^2-uEMSC distance (k = 2)
         let conformance = (&finite_lang as &dyn EbiTraitFiniteStochasticLanguage)
-            .markovian_conformance(Box::new(petri_net), 2, DistanceMetric::Uemsc)
+            .markovian_conformance(Box::new(petri_net), 2, DistanceMetric::Uemsc, Fraction::from((1, 1000)))
             .unwrap();
 
         println!("Computed m^2-uEMSC conformance: {}", conformance);
