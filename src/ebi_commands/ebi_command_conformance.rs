@@ -306,7 +306,7 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
         "A finite stochastic language (log) to compare.",
         "A queriable stochastic language (model) to compare.",
         "The order k of the Markovian abstraction (should be at least 1).",
-        "Distance metric: one of uemsc | tv | js | hellinger.",
+        "Distance metric: one of uemsc | l2 | js | hellinger.",
         "Optional delta value for livelock patch (default: 0.001).",
     ],
     execute: |mut inputs, _| {
