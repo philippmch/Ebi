@@ -297,15 +297,17 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
     input_types: &[
         &[&EbiInputType::Trait(EbiTrait::FiniteStochasticLanguage)],
         &[&EbiInputType::Trait(EbiTrait::QueriableStochasticLanguage)],
-        &[&EbiInputType::Usize],
-        &[&EbiInputType::String],
+        &[&EbiInputType::Usize(None, None, None)],
+        &[&EbiInputType::String(None, None)],
+        &[&EbiInputType::Fraction(None, None, Some(crate::math::constant_fraction::ConstFraction::of(1, 1000)))],
     ],
-    input_names: &["FILE_1", "FILE_2", "K_ORDER", "METRIC"],
+    input_names: &["FILE_1", "FILE_2", "K_ORDER", "METRIC", "DELTA"],
     input_helps: &[
         "A finite stochastic language (log) to compare.",
         "A queriable stochastic language (model) to compare.",
         "The order k of the Markovian abstraction (should be at least 1).",
         "Distance metric: one of uemsc | tv | js | hellinger.",
+        "Optional delta value for livelock patch (default: 0.001).",
     ],
     execute: |mut inputs, _| {
         let log = inputs
@@ -333,8 +335,12 @@ pub const CONFORMANCE_STOCHASTIC_MARKOVIAN: EbiCommand = EbiCommand::Command {
             other => return Err(anyhow!(format!("Unknown metric '{}'.", other))),
         };
 
+        let delta = inputs
+            .remove(0)
+            .to_type::<ebi_arithmetic::fraction::Fraction>()?;
+
         let result = log
-            .markovian_conformance(model, *k, metric)
+            .markovian_conformance(model, *k, metric, *delta)
             .context("Compute SMA.")?;
 
         Ok(EbiOutput::Fraction(result))
